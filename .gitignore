@@ -18,3 +18,9 @@ shootingbets/betfair_cache/
 result.json
 *result*.json
 betfair_spec.json
+
+# Local environment, credentials, Telegram login sessions
+.venv/
+.env
+*.session
+*.session-journal

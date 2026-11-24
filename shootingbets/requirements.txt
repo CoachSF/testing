@@ -3,3 +3,6 @@ pandas>=2.2
 rapidfuzz>=3.0
 scipy>=1.11
 pytest>=8
+telethon>=1.36
+python-dotenv>=1.0
+requests>=2.31
