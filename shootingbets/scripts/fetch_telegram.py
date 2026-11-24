@@ -160,6 +160,31 @@ def _span(ts: int) -> str:
     return f"{d:%Y-%m-%d %H:%M:%S} UTC / {d.astimezone(ZoneInfo('Australia/Melbourne')):%Y-%m-%d %H:%M:%S} Melbourne"
 
 
+def write_export(doc: dict, out) -> int:
+    """Atomically write the export, print a summary (never message text), round-trip it through load_export.
+    Returns 0, or 3 when the loader does not see every type=="message" row."""
+    out, messages = Path(out), doc["messages"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, out)
+
+    ts = [int(m["date_unixtime"]) for m in messages]
+    print(f"written: {out}\n"
+          f"messages: {len(messages)}  service: {sum(m['type'] == 'service' for m in messages)}  "
+          f"edited: {sum('edited_unixtime' in m for m in messages)}  "
+          f"with_buttons: {sum('inline_bot_buttons' in m for m in messages)}")
+    if ts:
+        print(f"first: {_span(min(ts))}\nlast:  {_span(max(ts))}")
+    from sbroi.telegram_export import load_export
+    n, want = len(load_export(str(out))), sum(m["type"] == "message" for m in messages)
+    if n != want:
+        print(f"loader check FAILED: loader returned {n}, expected {want}")
+        return 3
+    print(f"loader check OK n={n}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--chat", default="ShootingBetsBot")
@@ -195,26 +220,7 @@ def main(argv=None) -> int:
                "fetched_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                "messages": messages}
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(out.name + ".tmp")
-    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, out)
-
-    ts = [int(m["date_unixtime"]) for m in messages]
-    print(f"written: {out}\n"
-          f"messages: {len(messages)}  service: {sum(m['type'] == 'service' for m in messages)}  "
-          f"edited: {sum('edited_unixtime' in m for m in messages)}  "
-          f"with_buttons: {sum('inline_bot_buttons' in m for m in messages)}")
-    if ts:
-        print(f"first: {_span(min(ts))}\nlast:  {_span(max(ts))}")
-    from sbroi.telegram_export import load_export
-    n, want = len(load_export(str(out))), sum(m["type"] == "message" for m in messages)
-    if n != want:
-        print(f"loader check FAILED: loader returned {n}, expected {want}")
-        return 3
-    print(f"loader check OK n={n}")
-    return 0
+    return write_export(doc, args.out)
 
 
 if __name__ == "__main__":
