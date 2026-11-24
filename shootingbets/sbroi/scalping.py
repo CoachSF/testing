@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .betfair_files import RunnerSeries
-from .pricing import ltp_at, ltp_path
+from .pricing import best_back_at, best_lay_at, ltp_at, ltp_path
 from .ticks import move, tick_diff
 
 
@@ -81,6 +81,27 @@ def fixed_horizon(r: RunnerSeries, t0: int, horizon_ms: int, off_ms: int | None,
     e = _entry(p0.price, side, entry_pen)
     x = _market_exit(p1.price, side, exit_pen)
     return TradeResult(side, e, x, reason, t1, _green(side, e, x, commission), tick_diff(p0.price, p1.price))
+
+
+def book_fixed_horizon(r: RunnerSeries, t0: int, horizon_ms: int, off_ms: int | None,
+                       side: str = "back_lay", commission: float = 0.0,
+                       stay_preoff: bool = True) -> TradeResult:
+    """Like ``fixed_horizon`` but a taker on the real book at both legs: back_lay = back at the best
+    back at t0, close by laying at the best lay at t1; lay_back = lay at best lay, close at best back."""
+    enter, leave = (best_back_at, best_lay_at) if side == "back_lay" else (best_lay_at, best_back_at)
+    p0 = enter(r, t0)
+    if p0 is None:
+        return TradeResult(side, None, None, "no_entry", None, None, None)
+    t1 = t0 + horizon_ms
+    reason = "time"
+    if stay_preoff and off_ms is not None and t1 >= off_ms:
+        t1 = off_ms - 1
+        reason = "off"
+    p1 = leave(r, t1) if t1 > t0 else None
+    if p1 is None:
+        return TradeResult(side, p0.price, None, "no_exit", None, None, None)
+    return TradeResult(side, p0.price, p1.price, reason, t1, _green(side, p0.price, p1.price, commission),
+                       tick_diff(p0.price, p1.price))
 
 
 def tp_sl(r: RunnerSeries, t0: int, tp_ticks: int, sl_ticks: int | None, max_ms: int,

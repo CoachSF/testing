@@ -12,6 +12,18 @@ Input: a DataFrame of *parsed* alerts with (at least) these columns
     sel_hc        optional handicap / line for handicap markets
     ref_odds      optional reference odds quoted in the alert (e.g. Pinnacle after the drop)
 Other columns are carried through untouched (useful as strategy features).
+
+Executable order-book columns (ADVANCED/PRO data; "x" prefix = taker on the book; NaN without a book):
+    has_book                    the runner has best back / best lay observations
+    bb_l{L}, bb_l{L}_size       best back (price a BACKER can take) and its size, L seconds after the alert
+    bl_l{L}, bl_l{L}_size       best lay (price a LAYER can take) and its size
+    bb_l0_age_min, bl_l0_age_min  staleness of those book observations at L=0
+    spread_ticks_l0, tv_l0      ladder ticks bb_l0 -> bl_l0; traded volume at the alert
+    bb_close, bl_close          last pre-off book (off - 1 ms)
+    xback_pl_l{L}_{ctag}        P/L backing at bb_l{L};  xlay_pl_l{L}_{ctag}  laying at bl_l{L}
+    xclose_back_pl_c0, xclose_lay_pl_c0   same at the pre-off close, no commission
+    xfx_{side}_h{h}[_reason]    green-up P/L (and exit reason) of a book taker scalp, pre-off alerts only
+ctag = commission percent, e.g. c5 (5%), c0, c4p8 (4.8%).
 """
 from __future__ import annotations
 
@@ -22,9 +34,10 @@ import pandas as pd
 
 from .betfair_files import MarketRecord
 from .matching import EventInfo, find_markets, match_event, resolve_runner
-from .pricing import ltp_at, preoff_close
+from .pricing import book_at, ltp_at, preoff_close, traded_volume_at
 from .roi import back_pl, lay_pl, runner_outcome
-from .scalping import event_study, fixed_horizon, tp_sl
+from .scalping import book_fixed_horizon, event_study, fixed_horizon, tp_sl
+from .ticks import tick_diff
 
 MIN = 60_000
 
@@ -42,7 +55,13 @@ class Config:
     tp_max_min: int = 240
     spread_pen: tuple[int, ...] = (0, 1)
     scalp_commission: float = 0.05
+    book: bool = True                                      # add the executable order-book columns (x*, bb_*, bl_*)
     extra: dict = field(default_factory=dict)
+
+
+def _ctag(c: float) -> str:
+    """Commission tag: 0.05 -> 'c5', 0 -> 'c0', 0.048 -> 'c4p8' (up to 2 decimals of a percent)."""
+    return "c" + f"{round(c * 100, 2):.2f}".rstrip("0").rstrip(".").replace(".", "p")
 
 
 def _ms(ts) -> int | None:
@@ -130,7 +149,7 @@ def enrich(alerts: pd.DataFrame, markets: dict[str, MarketRecord], index: dict[s
             for L in cfg.latencies_s:
                 pL = out[f"p_l{L}"]
                 for c in cfg.commissions:
-                    tag = f"l{L}_c{int(round(c * 100))}"
+                    tag = f"l{L}_{_ctag(c)}"
                     out[f"back_pl_{tag}"] = back_pl(pL, oc, c) if not np.isnan(pL) else np.nan
                     out[f"lay_pl_{tag}"] = lay_pl(pL, oc, c) if not np.isnan(pL) else np.nan
             pr = a.get("ref_odds")
@@ -138,6 +157,34 @@ def enrich(alerts: pd.DataFrame, markets: dict[str, MarketRecord], index: dict[s
                 out["ref_back_pl"] = back_pl(float(pr), oc, 0.0)  # bookmaker odds: no commission
             if not np.isnan(out["p_close"]):
                 out["close_back_pl_c0"] = back_pl(out["p_close"], oc, 0.0)
+        if cfg.book:
+            bk = {L: book_at(r, t_alert + L * 1000) for L in cfg.latencies_s}
+            for L, b in bk.items():
+                for k in ("bb", "bl"):
+                    out[f"{k}_l{L}"], out[f"{k}_l{L}_size"] = b[k], b[f"{k}_size"]
+            b0 = book_at(r, t_alert)
+            tv = traded_volume_at(r, t_alert)
+            bc = book_at(r, off - 1) if off else {"bb": np.nan, "bl": np.nan}
+            both = not (np.isnan(b0["bb"]) or np.isnan(b0["bl"]))
+            out.update(has_book=bool(r.bb_t or r.bl_t), bb_l0_age_min=b0["bb_age_ms"] / MIN,
+                       bl_l0_age_min=b0["bl_age_ms"] / MIN, tv_l0=np.nan if tv is None else tv,
+                       spread_ticks_l0=tick_diff(b0["bb"], b0["bl"]) if both else np.nan,
+                       bb_close=bc["bb"], bl_close=bc["bl"])
+            if oc.known:
+                for L, b in bk.items():
+                    for c in cfg.commissions:
+                        out[f"xback_pl_l{L}_{_ctag(c)}"] = np.nan if np.isnan(b["bb"]) else back_pl(b["bb"], oc, c)
+                        out[f"xlay_pl_l{L}_{_ctag(c)}"] = np.nan if np.isnan(b["bl"]) else lay_pl(b["bl"], oc, c)
+                if not np.isnan(bc["bb"]):
+                    out["xclose_back_pl_c0"] = back_pl(bc["bb"], oc, 0.0)
+                if not np.isnan(bc["bl"]):
+                    out["xclose_lay_pl_c0"] = lay_pl(bc["bl"], oc, 0.0)
+            if not out["in_play_at_alert"]:
+                for h in cfg.horizons_min:
+                    for side in ("back_lay", "lay_back"):
+                        tr = book_fixed_horizon(r, t_alert, h * MIN, off, side, cfg.scalp_commission)
+                        out[f"xfx_{side}_h{h}"] = tr.green_pl
+                        out[f"xfx_{side}_h{h}_reason"] = tr.exit_reason
         # event study (relative tick level vs t_alert)
         if not np.isnan(p0) and not out["in_play_at_alert"]:
             es = event_study(r, t_alert, [o * MIN for o in cfg.event_offsets_min], off)

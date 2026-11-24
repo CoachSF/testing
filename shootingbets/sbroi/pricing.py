@@ -43,6 +43,20 @@ def best_lay_at(r: RunnerSeries, t_ms: int) -> PricePoint | None:
     return _last_at_or_before(r.bl_t, r.bl_p, t_ms)
 
 
+def book_at(r: RunnerSeries, t_ms: int) -> dict:
+    """Best back / best lay (price, size, age_ms) from the last observation at or before t.
+
+    A side never observed yet, or whose last observation is NaN (side empty), is NaN throughout."""
+    out = {}
+    for k, ts, ps, ss in (("bb", r.bb_t, r.bb_p, r.bb_s), ("bl", r.bl_t, r.bl_p, r.bl_s)):
+        i = bisect.bisect_right(ts, t_ms) - 1
+        ok = i >= 0 and not math.isnan(ps[i])
+        out[k] = float(ps[i]) if ok else math.nan
+        out[f"{k}_size"] = float(ss[i]) if ok else math.nan
+        out[f"{k}_age_ms"] = t_ms - ts[i] if ok else math.nan
+    return out
+
+
 def traded_volume_at(r: RunnerSeries, t_ms: int) -> float | None:
     p = _last_at_or_before(r.tv_t, r.tv_v, t_ms)
     return None if p is None else p.price

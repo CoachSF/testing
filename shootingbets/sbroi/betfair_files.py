@@ -382,8 +382,9 @@ class _MarketBuilder:
             r.tv_v.append(float(rc["tv"]))
         touched = False
         lad = self._ladders.setdefault(key, {})
-        if img:
-            lad.clear()
+        # ``img`` is deliberately NOT used to clear the ladder: Betfair's historical files flag
+        # marketDefinition-change messages img=true, but their rc are deltas (incl. size-0 removals,
+        # a few runners only, one runner may be split over several rc entries). Clearing loses live levels.
         for fld in ("batb", "batl"):
             if fld in rc and rc[fld] is not None:
                 self._has_batb = True
