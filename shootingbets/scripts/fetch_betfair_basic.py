@@ -92,7 +92,7 @@ class Client:
             raise SystemExit(f"Unexpected (non-JSON) answer from Betfair for {method}: {raw[:200]!r}")
 
     def download(self, file_path: str) -> bytes:
-        url = API + "DownloadFile?filePath=" + urllib.parse.quote(file_path, safe="")
+        url = API + "DownloadFile?filePath=" + urllib.parse.quote(file_path, safe="/")
         req = urllib.request.Request(url, headers={"ssoid": self.ssoid, "User-Agent": UA})
         return self._open(req)
 
@@ -101,9 +101,12 @@ def day_filter(sport: str, plan: str, day: dt.date, market_types=None, countries
     f = {"sport": sport, "plan": plan,
          "fromDay": day.day, "fromMonth": day.month, "fromYear": day.year,
          "toDay": day.day, "toMonth": day.month, "toYear": day.year,
-         "marketTypesCollection": list(market_types or []),
-         "countriesCollection": list(countries or []),
          "fileTypeCollection": ["M"]}
+    # omit empty collections (= no filter) rather than sending [] which could mean "nothing"
+    if market_types:
+        f["marketTypesCollection"] = list(market_types)
+    if countries:
+        f["countriesCollection"] = list(countries)
     return f
 
 
