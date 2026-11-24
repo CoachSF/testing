@@ -2,6 +2,7 @@
 import bz2
 import json
 import math
+import shutil
 from datetime import datetime, timezone
 
 import numpy as np
@@ -13,7 +14,7 @@ from sbroi.betfair_files import RunnerSeries, load_markets, parse_stream_bytes
 from sbroi.matching import build_event_index
 from sbroi.pipeline import Config, _ctag, enrich
 from sbroi.pricing import book_at
-from sbroi.pro_index import COLUMNS, MarketStore, build_event_index_from_manifest, load_manifest
+from sbroi.pro_index import COLUMNS, EVENT_TYPE_SPORT, MarketStore, build_event_index_from_manifest, load_manifest
 from sbroi.scalping import book_fixed_horizon
 from sbroi.ticks import tick_diff
 
@@ -22,11 +23,11 @@ OFF = T0 + 120 * MIN
 
 
 def pro_lines(mid="1.700000001", market_type="MATCH_ODDS", event="34000001", name="Arsenal v Chelsea",
-              teams=("Arsenal", "Chelsea"), open_ms=OFF):
+              teams=("Arsenal", "Chelsea"), open_ms=OFF, betting_type="ODDS"):
     """PRO-style market: runner 1001 (winner) book moves; best back 2.48 / best lay 2.52 at the alert (T0)."""
     def d(**kw):
         x = md(market_type=market_type, event_name=name, open_ms=open_ms, **kw)
-        x["eventId"] = event
+        x["eventId"], x["bettingType"] = event, betting_type
         x["runners"][0]["name"], x["runners"][1]["name"] = teams
         return x
 
@@ -158,7 +159,8 @@ def test_enrich_pro_book_columns(tmp_path):
     assert a["status"] == "ok" and a["bf_data_level"] == "PRO" and a["has_book"] and a["won"] == 1
     assert (a["bb_l0"], a["bb_l0_size"], a["bl_l0"], a["bl_l0_size"]) == (2.48, 100.0, 2.52, 80.0)
     assert (a["bb_l0_age_min"], a["bl_l0_age_min"], a["tv_l0"]) == (30.0, 30.0, 1000.0)
-    assert a["spread_ticks_l0"] == tick_diff(2.48, 2.52) == 2
+    assert a["spread_ticks_l0"] == tick_diff(2.48, 2.52) == 2 and a["spread_pct_l0"] == pytest.approx(2.52 / 2.48 - 1)
+    assert [bool(a[f"book_ok_l{L}"]) for L in (0, 60, 120, 300)] == [True] * 4         # 2.48 / 2.52, and 2.48 / 2.40 at 300 s
     assert (a["bb_l120"], a["bl_l120"]) == (2.48, 2.52)
     assert (a["bb_l300"], a["bl_l300"], a["bl_l300_size"]) == (2.48, 2.40, 55.0)  # observation at exactly t+300s counts
     assert (a["bb_close"], a["bl_close"]) == (2.3, 2.34)                           # last pre-off book, not in-play 1.9
@@ -176,7 +178,7 @@ def test_enrich_pro_book_columns(tmp_path):
     assert a["back_pl_l0_c4p8"] == pytest.approx(1.5 * 0.952) and a["p_close"] == 2.5
     # switching the book off removes every new column
     b = enrich(alerts(("Arsenal FC", "Chelsea FC")), mk, build_event_index(mk), Config(book=False))
-    assert not [c for c in b.columns if c.startswith(("x", "bb_", "bl_", "has_book", "spread_", "tv_"))]
+    assert not [c for c in b.columns if c.startswith(("x", "bb_", "bl_", "has_book", "spread_", "tv_", "book_ok"))]
     assert b.iloc[0]["p_l0"] == 2.5
 
 
@@ -184,6 +186,7 @@ def test_enrich_basic_market_has_no_book(basic_bz2):
     mk = load_markets(basic_bz2)
     a = enrich(alerts(("Arsenal FC", "Chelsea FC")), mk, build_event_index(mk), Config()).iloc[0]
     assert a["status"] == "ok" and a["bf_data_level"] == "BASIC" and not a["has_book"]
+    assert not a["book_ok_l0"] and np.isnan(a["spread_pct_l0"])                      # no book: not tradeable, no spread
     assert all(np.isnan(a[k]) for k in ("bb_l0", "bl_l0", "bb_l0_size", "spread_ticks_l0", "tv_l0", "bb_close",
                                         "xback_pl_l0_c0", "xlay_pl_l0_c0"))
     assert a["xfx_back_lay_h10_reason"] == "no_entry" and a["p_l0"] == 2.5
@@ -237,6 +240,67 @@ def test_manifest_and_event_index(pro_dir, tmp_path_factory):
                           {"market_id": "m2", "event_id": "9", "event_name": "A v B", "market_type": "OVER_UNDER_15",
                            "market_time_ms": 3000, "country_code": None}])
     assert build_event_index_from_manifest(no_mo)["9"].open_date_ms == 3000  # no MATCH_ODDS: earliest row
+
+
+def _manifest(root, *rows, month="2026-10"):
+    root.mkdir(parents=True, exist_ok=True)
+    base = {"country_code": "GB", "bytes": 10, "member": "m", "market_time": _iso(OFF), "market_type": "MATCH_ODDS"}
+    (root / f"manifest_{month}.jsonl").write_text("\n".join(json.dumps({**base, **r}) for r in rows) + "\n", encoding="utf-8")
+
+
+def test_manifest_of_several_folders_event_types_and_default_sports(tmp_path):
+    a, b = tmp_path / "soccer", tmp_path / "other"
+    _manifest(a, dict(market_id="1.1", event_id="E1", event_name="Arsenal v Chelsea", saved="d/E1/1.1.bz2"))   # no event_type_id
+    _manifest(b, dict(market_id="1.2", event_id="E2", event_name="Lakers v Celtics", saved="d/E2/1.2.bz2", event_type_id="7522"),
+              dict(market_id="1.3", event_id="E3", event_name="Nadal v Federer", saved="d/E3/1.3.bz2", event_type_id=2),  # int id
+              dict(market_id="1.4", event_id="E4", event_name="Foo v Bar", saved="d/E4/1.4.bz2"),                         # none
+              dict(market_id="1.5", event_id="E5", event_name="Baz v Qux", saved="d/E5/1.5.bz2", event_type_id="999"))
+    assert EVENT_TYPE_SPORT["1"] == "Soccer" and EVENT_TYPE_SPORT["7522"] == "Basketball" and len(EVENT_TYPE_SPORT) == 16
+    df = load_manifest([a, str(b)], default_sports=["Soccer", "Handball"])
+    r = df.set_index("market_id")
+    assert list(df.columns) == COLUMNS and len(df) == 5
+    assert list(r["root"]) == [str(a)] + [str(b)] * 4 and list(r["default_sport"]) == ["Soccer"] + ["Handball"] * 4
+    assert r.loc["1.1", "event_type_id"] is None and r.loc["1.4", "event_type_id"] is None
+    assert (r.loc["1.2", "event_type_id"], r.loc["1.3", "event_type_id"], r.loc["1.5", "event_type_id"]) == ("7522", "2", "999")
+    sport = lambda d, **kw: {e: x.sport for e, x in build_event_index_from_manifest(d, **kw).items()}  # noqa: E731
+    assert sport(df) == {"E1": "Soccer", "E2": "Basketball", "E3": "Tennis", "E4": "Handball", "E5": "eventType:999"}
+    assert sport(df.drop(columns="default_sport"), sport="Rugby Union") == {
+        "E1": "Rugby Union", "E2": "Basketball", "E3": "Tennis", "E4": "Rugby Union", "E5": "eventType:999"}
+    # a dict keys the default sport by folder; folders left out and a single folder default to Soccer
+    d2 = load_manifest([a, b], default_sports={str(b): "Handball"})
+    assert list(d2.set_index("market_id").loc[["1.1", "1.4"], "default_sport"]) == ["Soccer", "Handball"]
+    one = load_manifest(b)
+    assert set(one["root"]) == {str(b)} and set(one["default_sport"]) == {"Soccer"} and sport(one)["E4"] == "Soccer"
+    # the same market in two folders: the larger file wins and brings its own root
+    _manifest(tmp_path / "dup", dict(market_id="1.1", event_id="E1", event_name="Arsenal v Chelsea", saved="x/1.1.bz2", bytes=99))
+    assert load_manifest([a, tmp_path / "dup"]).set_index("market_id").loc["1.1", "root"] == str(tmp_path / "dup")
+
+
+def split_pro_dir(pro_dir, other):
+    """Move the 2026-10 manifest and its market files of the ``pro_dir`` fixture into ``other``."""
+    man = pro_dir / "manifest_2026-10.jsonl"
+    for line in man.read_text(encoding="utf-8").splitlines():
+        rel = json.loads(line)["saved"]
+        (other / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(pro_dir / rel, other / rel)
+    shutil.move(man, other / man.name)
+
+
+def test_market_store_resolves_each_file_under_its_own_root(pro_dir, tmp_path_factory):
+    other = tmp_path_factory.mktemp("other")
+    split_pro_dir(pro_dir, other)
+    df = load_manifest([pro_dir, other])
+    assert set(df["root"]) == {str(pro_dir), str(other)}
+    store = MarketStore(pro_dir, df)                                   # out_dir is only the fallback
+    assert all(m in store for m in df["market_id"]) and store["1.700000003"].market_id == "1.700000003"
+    assert (other / df.set_index("market_id").loc["1.700000003", "saved"]).is_file()
+    got = enrich(alerts(("Arsenal FC", "Chelsea FC"), ("Everton", "Fulham")), store, build_event_index_from_manifest(df),
+                 Config(commissions=(0.0,)))
+    assert list(got["status"]) == ["ok", "ok"] and list(got["bb_l0"]) == [2.48, 2.48]
+    # without a root column every file is looked up under out_dir, as before: the moved markets are not found
+    plain = MarketStore(pro_dir, df.drop(columns="root"))
+    assert "1.700000001" in plain and "1.700000003" not in plain and plain.get("1.700000003") is None
+    assert MarketStore(other, df)["1.700000001"].market_id == "1.700000001"       # root wins over out_dir
 
 
 def test_market_store_matches_eager_loading_and_is_lazy(pro_dir):

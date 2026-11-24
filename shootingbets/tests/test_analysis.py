@@ -109,7 +109,8 @@ def test_leg_frame_exclusions_are_counted_by_reason_and_not_in_the_leg():
         {"status": "no_event_match", "in_play_at_alert": True, "p_l0": nan},                  # 8 counted ONCE (first reason)
     ])
     leg = A.leg_frame(df, "back", "ltp")
-    assert leg.attrs["excluded"] == {"not_matched": 2, "no_result": 1, "void": 1, "in_play": 1, "no_price": 2, "no_pl": 1}
+    assert leg.attrs["excluded"] == {"not_matched": 2, "no_result": 1, "void": 1, "in_play": 1, "no_price": 2,
+                                     "no_tradeable_book": 0, "no_pl": 1}
     assert leg.attrs["n_input"] == 9 and list(leg["alert_id"]) == [0]
     assert sum(leg.attrs["excluded"].values()) + len(leg) == 9                                 # nothing vanished silently
     leg2 = A.leg_frame(df, "back", "ltp", preoff_only=False)                                   # in-play row is kept
@@ -124,6 +125,59 @@ def test_leg_frame_carries_features_but_not_heavy_columns():
     assert list(leg.columns[:9]) == A.LEG_COLS
     assert "sport" in leg and "ref_odds" in leg and "bb_l0" in leg
     assert not [c for c in leg.columns if c.startswith(("fx_", "es_", "back_pl_", "xlay_pl_"))] and "status" not in leg
+
+
+def test_book_legs_need_a_tradeable_book_and_frames_without_the_column_are_unchanged():
+    df = mkframe([{}, {"bb_l0": 1.12, "bl_l0": 2.96}, {"bl_l0": NAN}, {}, {}])
+    df["book_ok_l0"] = [True, False, False, None, True]       # 1 wide, 2 one-sided, 3 not True, 4 fine at L = 0
+    df["book_ok_l60"] = [True, True, False, True, False]
+    back = A.leg_frame(df, "back", "book")
+    assert list(back["alert_id"]) == [0, 4] and back.attrs["excluded"]["no_tradeable_book"] == 3
+    assert sum(back.attrs["excluded"].values()) + len(back) == 5                       # nothing vanished silently
+    lay = A.leg_frame(df, "lay", "book")                                               # row 2 has no lay price at all
+    assert list(lay["alert_id"]) == [0, 4] and lay.attrs["excluded"]["no_price"] == 1
+    assert lay.attrs["excluded"]["no_tradeable_book"] == 2                             # ... so only rows 1 and 3 are "not tradeable"
+    b60 = A.leg_frame(df, "back", "book", latency=60)                                  # each latency reads its own flag
+    assert list(b60["alert_id"]) == [0, 1, 3] and b60.attrs["excluded"]["no_tradeable_book"] == 2
+    for price in ("ltp", "ref", "close"):                                              # other legs are not touched
+        assert len(A.leg_frame(df, "back", price)) == 5
+    old = df.drop(columns=["book_ok_l0", "book_ok_l60"])                               # an older frame: as before, no exclusion
+    ob = A.leg_frame(old, "back", "book")
+    assert list(ob["alert_id"]) == [0, 1, 2, 3, 4] and ob.attrs["excluded"]["no_tradeable_book"] == 0
+    h = A.headline(df, commissions=(C,), latencies=(0, 60))
+    r = h[(h.side == "back") & (h.price == "book") & (h.latency_s == 0)].iloc[0]
+    assert r["n"] == 2 and json.loads(r["excluded"])["no_tradeable_book"] == 3
+
+
+def test_book_taker_scalps_use_only_tradeable_books():
+    df = mkframe([{}, {}, {}, {}])
+    df["xfx_back_lay_h5"] = [0.1, 0.2, 0.3, 0.4]
+    df["fx_back_lay_h5_s0"] = [0.1, 0.2, 0.3, 0.4]
+    df["book_ok_l0"] = [True, False, True, True]
+    fixed, _ = A.scalping_tables(df)
+    bk, lt = fixed[fixed.basis == "book"].iloc[0], fixed[fixed.basis == "ltp"].iloc[0]
+    assert bk["n"] == 3 and bk["mean_green"] == pytest.approx((0.1 + 0.3 + 0.4) / 3) and lt["n"] == 4
+    again, _ = A.scalping_tables(df.drop(columns="book_ok_l0"))
+    assert again[again.basis == "book"].iloc[0]["n"] == 4
+
+
+def test_min_odds_best_back_and_the_gap_on_tradeable_books_hand_worked():
+    df = mkframe([{"ref_odds": 2.0, "bb_l0": 1.9, "bl_l0": 2.0}, {"ref_odds": 2.0, "bb_l0": 2.0, "bl_l0": 2.1},
+                  {"ref_odds": 2.0, "bb_l0": 2.2, "bl_l0": 2.3}, {"ref_odds": 2.0, "bb_l0": NAN, "bl_l0": 2.4},
+                  {"status": "no_event_match", "ref_odds": 2.0}])
+    df["book_ok_l0"] = [True, True, False, True, True]
+    bb = A.min_odds_best_back(df)
+    assert bb.columns.tolist() == ["latency_s", "n", "k"] and bb["latency_s"].tolist() == [0, 60, 120, 300]
+    assert bb["n"].tolist() == [3, 3, 0, 0] and bb["k"].tolist() == [2, 2, 0, 0]       # 2.0 >= 2.0 counts; row 3 has no back
+    g = A.min_odds_gap(df)                                                             # rows 0 and 1 only (2 wide, 3 one-sided)
+    assert g["n"] == 2 and g["lay_ge_min"] == 2
+    assert g["best_back"] == pytest.approx({"median": -0.025, "min": -0.05, "max": 0.0})
+    assert g["mid"] == pytest.approx({"median": 0.0, "min": -0.025, "max": 0.025})
+    e = A.min_odds_gap(df.assign(book_ok_l0=False))
+    assert e["n"] == 0 and np.isnan(e["best_back"]["median"]) and e["lay_ge_min"] == 0
+    assert A.min_odds_best_back(df.iloc[0:0])["n"].tolist() == [0, 0, 0, 0]
+    z = A.resting_order(mkframe([{}]))                                                 # no limit columns at all
+    assert z["has_columns"] is False and z["placed"] == 1 and z["filled"] == 0 and np.isnan(z["roi"])
 
 
 # ----------------------------------------------------------------------------- e. summarize_leg

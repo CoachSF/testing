@@ -102,6 +102,7 @@ def test_extract_end_to_end(tar_path, tmp_path, capsys):
     assert {r["market_id"] for r in rows} == KEPT and {r["saved"] for r in rows} == KEPT_FILES
     assert {r["member"] for r in rows} == {n for n, _, k in MEMBERS if k}
     assert all(r["market_type"] == "MATCH_ODDS" and r["country_code"] == "GB" and r["bytes"] > 0 for r in rows)
+    assert all(r["event_type_id"] == "1" for r in rows)  # the manifest carries the sport (Betfair eventTypeId)
     done = json.loads((out / f"_done_{MONTH}.json").read_text())
     assert (done["members_seen"], done["in_path_window"], done["kept"], done["already"], done["no_def"]) == (7, 6, 3, 0, 1)
     assert done["kept_bytes"] == sum(len(raw) for _, raw, k in MEMBERS if k)

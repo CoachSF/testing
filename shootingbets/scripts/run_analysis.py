@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 """Alerts CSV -> enrich against the Betfair PRO store (one alert at a time) -> CSV tables + report.html.
 
-    python scripts/run_analysis.py --alerts alerts.csv [--pro-dir data/betfair_pro] [--out output]
+    python scripts/run_analysis.py --alerts alerts.csv [--pro-dir DIR[=Sport] ...] [--coverage-end ISO] [--out output]
+--pro-dir takes one or more PRO folders; ``DIR=Sport`` sets the sport of the rows whose manifest has no event_type_id
+(default Soccer). --coverage-end (e.g. 2026-11-01T00:00:00Z): alerts kicking off at/after it are "pro_not_published".
 Exit code 0 when the report was written, 2 on bad input. An exception while enriching ONE alert becomes a row
 with status "error:<ExceptionName>" (message in the ``error`` column); it never kills the run.
 """
@@ -43,6 +45,12 @@ def load_alerts(path, limit=None) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def parse_pro_dirs(values) -> tuple[list[str], list[str]]:
+    """["DIR", "DIR2=Tennis"] -> (["DIR", "DIR2"], ["Soccer", "Tennis"])."""
+    pairs = [(v.rpartition("=")[0], v.rpartition("=")[2]) if "=" in v else (v, "") for v in values]
+    return [d for d, _ in pairs], [s or "Soccer" for _, s in pairs]
+
+
 def _peak_mb():
     try:
         import ctypes
@@ -66,8 +74,12 @@ def _peak_mb():
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--alerts", required=True, help="alerts CSV (columns per sbroi/pipeline.py)")
-    ap.add_argument("--pro-dir", default="data/betfair_pro")
+    ap.add_argument("--pro-dir", nargs="+", default=["data/betfair_pro"], metavar="DIR[=Sport]",
+                    help="one or more PRO folders; DIR=Sport = default sport of rows without event_type_id (default Soccer)")
     ap.add_argument("--out", default="output")
+    ap.add_argument("--coverage-end", default=None, metavar="ISO",
+                    help="end of the published PRO data, e.g. 2026-11-01T00:00:00Z: alerts kicking off at/after it get "
+                         "status pro_not_published and are not matched (default: none)")
     ap.add_argument("--commission", type=float, default=0.048)
     ap.add_argument("--label", default=None, help="banner text, e.g. to mark smoke-test output as not real")
     ap.add_argument("--max-cached", type=int, default=16)
@@ -75,15 +87,18 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     try:
         alerts = load_alerts(a.alerts, a.limit)
-        manifest = load_manifest(a.pro_dir)
+        dirs, sports = parse_pro_dirs(a.pro_dir)
+        manifest = load_manifest(dirs, sports)
         if manifest.empty:
-            raise ValueError(f"no manifest_*.jsonl rows in {a.pro_dir}")
+            raise ValueError(f"no manifest_*.jsonl rows in {', '.join(dirs)}")
+        end = None if a.coverage_end is None else pd.Timestamp(a.coverage_end)
+        end_ms = None if end is None else int((end.tz_localize("UTC") if end.tzinfo is None else end).timestamp() * 1000)
     except (OSError, ValueError, KeyError) as e:
         print(f"bad input: {type(e).__name__}: {e}")
         return 2
     index = build_event_index_from_manifest(manifest)
-    store = MarketStore(a.pro_dir, manifest, max_cached=a.max_cached)
-    cfg = Config(commissions=tuple(sorted({*COMMISSIONS, a.commission})), scalp_commission=a.commission)
+    store = MarketStore(dirs[0], manifest, max_cached=a.max_cached)
+    cfg = Config(commissions=tuple(sorted({*COMMISSIONS, a.commission})), scalp_commission=a.commission, coverage_end_ms=end_ms)
     parts, t0, n = [], time.time(), len(alerts)
     for i in range(n):
         one = alerts.iloc[[i]]

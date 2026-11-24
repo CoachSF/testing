@@ -19,7 +19,7 @@ from . import segments as _seg
 from .pipeline import _ctag
 
 REAL_COMMISSION = 0.048
-REASONS = ("not_matched", "no_result", "void", "in_play", "no_price", "no_pl")
+REASONS = ("not_matched", "no_result", "void", "in_play", "no_price", "no_tradeable_book", "no_pl")
 NAN = float("nan")
 
 # (side, price) -> (odds column, P/L column)
@@ -135,12 +135,15 @@ def leg_frame(enriched: pd.DataFrame, side: str, price: str, latency: int = 0,
         known &= df["result_known"].eq(True).to_numpy()
     alive = np.ones(len(df), bool)
     excl = dict.fromkeys(REASONS, 0)
+    bok = f"book_ok_l{int(latency)}"   # book legs need a two-sided book that is not wide; frames without it: no exclusion
+    no_book = ~df[bok].eq(True).to_numpy() if price == "book" and bok in df else np.zeros(len(df), bool)
     for reason, bad in (
         ("not_matched", df["status"].ne("ok").to_numpy()),
         ("no_result", ~known),
         ("void", np.nan_to_num(void) > 0),
         ("in_play", df["in_play_at_alert"].eq(True).to_numpy() if preoff_only else np.zeros(len(df), bool)),
         ("no_price", ~(np.isfinite(odds) & (odds > 1))),
+        ("no_tradeable_book", no_book),
         ("no_pl", ~np.isfinite(pl)),
     ):
         excl[reason] = int((alive & bad).sum())
@@ -359,7 +362,7 @@ def walk_forward_leg(leg: pd.DataFrame, cat_cols, num_cols, commission: float, n
 
 # --------------------------------------------------------------------------------------------- j. verdict
 VERDICT_COLS = ["rule", "n", "roi", "roi_cl_lo", "p_null", "bh_pass", "clv_mean", "clv_ci_lo",
-                "oos_selected", "oos_roi", "positive"]
+                "oos_selected", "oos_roi", "oos_n", "positive"]
 
 
 def verdict(segments_df: pd.DataFrame, wf: dict, min_n: int = 30) -> pd.DataFrame:
@@ -380,7 +383,7 @@ def verdict(segments_df: pd.DataFrame, wf: dict, min_n: int = 30) -> pd.DataFram
         pos = bool(r.bh_pass) and r.roi_cl_lo > 0 and r.clv_ci_lo > 0 and oos > 0  # NaN compares False
         rows.append({"rule": r.rule, "n": r.n, "roi": r.roi, "roi_cl_lo": r.roi_cl_lo, "p_null": r.p_null,
                      "bh_pass": bool(r.bh_pass), "clv_mean": r.clv_mean, "clv_ci_lo": r.clv_ci_lo,
-                     "oos_selected": a is not None, "oos_roi": oos, "positive": bool(pos)})
+                     "oos_selected": a is not None, "oos_roi": oos, "oos_n": a[0] if a else 0, "positive": bool(pos)})
     out = pd.DataFrame(rows, columns=VERDICT_COLS)
     return out.sort_values(["positive", "roi"], ascending=[False, False], kind="stable").reset_index(drop=True)
 
@@ -410,6 +413,7 @@ def _green_stats(e: pd.DataFrame, col: str) -> dict:
 
 def scalping_tables(enriched: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     e = _eligible(enriched)
+    e_book = e[e["book_ok_l0"].eq(True)] if "book_ok_l0" in e else e      # book takers need a tradeable book at the alert
     fixed, tpsl = [], []
     for c in e.columns:
         if m := _FIX_LTP.fullmatch(c):
@@ -426,7 +430,7 @@ def scalping_tables(enriched: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
         else:
             continue
         fixed.append({"basis": basis, "side": side, "horizon_min": h, "horizon": "to_off" if h == 100000 else str(h),
-                      "pen": pen, **_green_stats(e, c)})
+                      "pen": pen, **_green_stats(e_book if basis == "book" else e, c)})
     f = pd.DataFrame(fixed, columns=FIXED_COLS)
     f = f.sort_values(["basis", "side", "pen", "horizon_min"], kind="stable").reset_index(drop=True)
     t = pd.DataFrame(tpsl, columns=TPSL_COLS)
@@ -467,6 +471,113 @@ def match_report(enriched: pd.DataFrame, seed: int = 1234) -> tuple[pd.DataFrame
     ok = df[df["status"].eq("ok")]
     spot = ok.sample(min(20, len(ok)), random_state=seed)[[c for c in spot_cols if c in df]]
     return summary, review.reset_index(drop=True), spot.reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------------------------- l2. funnel, vendor
+FUNNEL_COLS = ["sport", "alerts", "pro_not_published", "in_coverage", "event_on_betfair", "market_found", "runner_found",
+               "priced_at_alert", "tradeable_at_alert", "priced_and_settled", "tradeable_and_settled"]
+
+
+def funnel_table(enriched: pd.DataFrame) -> pd.DataFrame:
+    """Where the alerts drop out on the way to a priced, settled Betfair bet: one row per sport plus "All"."""
+    df, st = enriched, enriched["status"]
+    ok = st.eq("ok")
+    priced = ok & pd.to_numeric(_col(df, "bb_l0"), errors="coerce").notna()
+    tradeable = ok & _col(df, "book_ok_l0").eq(True)
+    settled = _col(df, "result_known").eq(True) & ~(pd.to_numeric(_col(df, "void"), errors="coerce").fillna(0) > 0)
+    f = pd.DataFrame({"sport": _col(df, "sport", "(none)").fillna("(none)"), "alerts": 1,
+                      "pro_not_published": st.eq("pro_not_published"), "in_coverage": ~st.eq("pro_not_published"),
+                      "event_on_betfair": ~st.isin(["pro_not_published", "no_event_match"]),
+                      "market_found": st.isin(["no_runner", "ok"]), "runner_found": ok, "priced_at_alert": priced,
+                      "tradeable_at_alert": tradeable, "priced_and_settled": priced & settled,
+                      "tradeable_and_settled": tradeable & settled})
+    t = f.groupby("sport").sum().astype(int)
+    t.loc["All"] = t.sum()
+    return t.reset_index()[FUNNEL_COLS]
+
+
+VENDOR_COLS = ["leg", "n", "strike_rate", "avg_odds", "roi", "roi_ci_lo", "roi_ci_hi", "p_null"]
+
+
+def vendor_table(enriched: pd.DataFrame) -> pd.DataFrame:
+    """The two bookmaker-odds legs of the vendor-scored alerts (no commission): the alert's Min. Odds on its own line,
+    and Bet365's odds on Bet365's line as the vendor scores it."""
+    df = enriched
+    mo = pd.to_numeric(df["min_odds"] if "min_odds" in df else _col(df, "ref_odds"), errors="coerce")
+    rows = []
+    for name, plc, odds in (("Back at the alert's Min. Odds on the alert's own line", "own_pl_min", mo),
+                            ("Back at Bet365 odds on Bet365's line, as the vendor scores it", "v_pl_b365",
+                             pd.to_numeric(_col(df, "v_b365_odds"), errors="coerce"))):
+        pl = pd.to_numeric(_col(df, plc), errors="coerce")
+        ok = (pl.notna() & odds.notna()).to_numpy()
+        p, o = pl.to_numpy(float)[ok], odds.to_numpy(float)[ok]
+        s = _roi.summarize(p, o, (p > 0).astype(float), commission=0.0, n_boot=4000, run_null=False)
+        rows.append({"leg": name, "n": int(ok.sum()), "strike_rate": s.strike_rate, "avg_odds": s.avg_odds, "roi": s.roi,
+                     "roi_ci_lo": s.roi_ci_lo, "roi_ci_hi": s.roi_ci_hi,
+                     "p_null": null_p(pd.DataFrame({"odds": o, "pl": p}), "back", 0.0)})
+    return pd.DataFrame(rows, columns=VENDOR_COLS)
+
+
+# --------------------------------------------------------------------------------------------- l3. against Min. Odds
+MIN_ODDS_LATENCIES = (0, 60, 120, 300)
+
+
+def _num(df: pd.DataFrame, c: str) -> pd.Series:
+    return pd.to_numeric(_col(df, c), errors="coerce")
+
+
+def min_odds_best_back(enriched: pd.DataFrame) -> pd.DataFrame:
+    """Per delay: of the ok alerts with a best back, in how many it was at or above the alert's Min. Odds (ref_odds)."""
+    ok, ref = enriched["status"].eq("ok"), _num(enriched, "ref_odds")
+    rows = []
+    for L in MIN_ODDS_LATENCIES:
+        bb = _num(enriched, f"bb_l{L}")
+        priced = ok & bb.notna() & ref.notna()
+        rows.append({"latency_s": L, "n": int(priced.sum()), "k": int((priced & (bb >= ref)).sum())})
+    return pd.DataFrame(rows)
+
+
+def min_odds_gap(enriched: pd.DataFrame) -> dict:
+    """Tradeable books at the alert: price / Min. Odds - 1 for the best back and for the mid price, and how many best lays
+    were at or above Min. Odds."""
+    ref, bb, bl = (_num(enriched, c) for c in ("ref_odds", "bb_l0", "bl_l0"))
+    m = enriched["status"].eq("ok") & _col(enriched, "book_ok_l0").eq(True) & ref.notna() & bb.notna() & bl.notna()
+    st = lambda g: {"median": float(g.median()), "min": float(g.min()), "max": float(g.max())} if len(g) else \
+        dict.fromkeys(("median", "min", "max"), NAN)  # noqa: E731
+    return {"n": int(m.sum()), "best_back": st((bb / ref - 1)[m]), "mid": st(((bb + bl) / 2 / ref - 1)[m]),
+            "lay_ge_min": int((bl[m] >= ref[m]).sum())}
+
+
+def resting_order(enriched: pd.DataFrame, commission: float = REAL_COMMISSION) -> dict:
+    """A resting back order at Min. Odds on every pre-off, settled, non-void ok alert: a touch fill (the last traded price
+    reached Min. Odds after the alert, before the off). ROI and its i.i.d. bootstrap CI are on the filled orders."""
+    df, col = enriched, f"limit_pl_{_ctag(commission)}"
+    pl_all = _num(df, col)
+    placed = (df["status"].eq("ok") & ~_col(df, "in_play_at_alert").eq(True) & _col(df, "result_known").eq(True)
+              & ~(_num(df, "void").fillna(0) > 0))
+    filled = placed & _col(df, "limit_fill").eq(True) & pl_all.notna()
+    won = _num(df, "won")[filled].to_numpy(float)
+    s = _roi.summarize(pl_all[filled].to_numpy(float), _num(df, "ref_odds")[filled].to_numpy(float), won,
+                       commission=commission, n_boot=4000, run_null=False)
+    return {"column": col, "has_columns": bool(col in df and "limit_fill" in df), "placed": int(placed.sum()),
+            "traded": int((placed & (_num(df, "n_trades_after") > 0)).sum()), "filled": int(filled.sum()),
+            "wins": int((won == 1).sum()), "strike_rate": s.strike_rate, "avg_odds": s.avg_odds, "roi": s.roi,
+            "roi_ci_lo": s.roi_ci_lo, "roi_ci_hi": s.roi_ci_hi}
+
+
+def min_odds_check(enriched: pd.DataFrame, commission: float = REAL_COMMISSION) -> pd.DataFrame:
+    """One row per ok alert: the Betfair book at the alert against Min. Odds, and the resting-order outcome."""
+    e = enriched[enriched["status"].eq("ok")]
+    ref = _num(e, "min_odds").fillna(_num(e, "ref_odds")) if "min_odds" in e else _num(e, "ref_odds")
+    home, away = (_col(e, f"{s}_raw").astype(object).fillna(_col(e, s).astype(object)) for s in ("home", "away"))
+    lim = f"limit_pl_{_ctag(commission)}"
+    return pd.DataFrame({
+        "alert_id": _col(e, "alert_id"), "ts": _col(e, "ts"), "sport": _col(e, "sport"),
+        "fixture": home.astype(str) + " v " + away.astype(str), "selection_raw": _col(e, "selection_raw"), "min_odds": ref,
+        "bb_l0": _col(e, "bb_l0"), "bl_l0": _col(e, "bl_l0"), "spread_pct_l0": _col(e, "spread_pct_l0"),
+        "book_ok_l0": _col(e, "book_ok_l0"), "bb/min-1": _num(e, "bb_l0") / ref - 1, "max_ltp_after": _col(e, "max_ltp_after"),
+        "n_trades_after": _col(e, "n_trades_after"), "limit_fill": _col(e, "limit_fill"), "won": _col(e, "won"),
+        "void": _col(e, "void"), lim: _col(e, lim)}).reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------------------------- m. curve

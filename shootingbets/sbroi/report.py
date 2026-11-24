@@ -11,13 +11,16 @@ import numpy as np
 import pandas as pd
 
 from . import analysis as A
+from .vendor import NEW_COLS as VENDOR_JOIN_COLS
 
 MEL = ZoneInfo("Australia/Melbourne")
 CAT_COLS = ["sport", "league", "bf_country", "bf_market", "sel_kind", "odds_band", "mins_to_off_band", "spread_band",
-            "liq_band", "drop_band", "hour_utc", "dow", "is_repeat"]
-NUM_COLS = ["drop_pct", "ref_odds", "gap_book", "gap_ltp", "mins_to_off", "bb_l0", "bb_l0_size", "spread_ticks_l0", "repeat_n"]
+            "liq_band", "drop_band", "hour_utc", "dow", "is_repeat", "mkt_kind", "sel_side", "check_status", "country",
+            "is_women", "age_group", "scope", "is_reserve"]
+NUM_COLS = ["drop_pct", "ref_odds", "gap_book", "gap_ltp", "mins_to_off", "bb_l0", "bb_l0_size", "spread_ticks_l0", "repeat_n",
+            "mins_to_kickoff", "n_alt", "mins_since_window_open", "check_odds"]
 LEG_LABEL = {("back", "book"): "Back at best back", ("lay", "book"): "Lay at best lay", ("back", "ltp"): "Back at last traded price",
-             ("lay", "ltp"): "Lay at last traded price", ("back", "ref"): "Back at Pinnacle quote",
+             ("lay", "ltp"): "Lay at last traded price", ("back", "ref"): "Back at the alert's quoted Min. Odds (bookmaker, no commission)",
              ("back", "close"): "Back at Betfair close (last traded)"}
 
 # --------------------------------------------------------------------------------------------- formatting
@@ -43,6 +46,14 @@ def pval(v):
 
 def ci(lo, hi, f=pct):
     return "n/a" if _na(lo) or _na(hi) else f"[{f(lo)}, {f(hi)}]"
+
+
+MIN_BETS, TOO_FEW = 30, "too few bets to conclude"
+
+
+def _few(n, text):
+    """An ROI cell (already escaped) that rests on fewer than MIN_BETS settled bets carries a visible label."""
+    return text if _na(n) or n == 0 or n >= MIN_BETS else f'{text} <span class="warn">{TOO_FEW}</span>'
 
 
 def ts_both(t) -> str:
@@ -334,6 +345,7 @@ svg.c{display:block;width:100%;max-width:720px;height:auto;touch-action:pan-y}
 .tip{position:absolute;top:6px;left:0;display:none;pointer-events:none;z-index:2;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 8px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.15);transform:translateX(10px)}
 .tip.flip{transform:translateX(calc(-100% - 10px))}.tip div{line-height:1.5}.tip .sw{display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--c);margin-right:5px}
 details{margin:8px 0}summary{cursor:pointer;color:var(--text-2);font-size:13px}
+.warn{color:var(--series-2);font-weight:600;font-size:12px;white-space:nowrap}
 .verdict{background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--series-1);border-radius:6px;padding:10px 12px;margin:10px 0}
 @media (max-width:600px){h1{font-size:20px}.tile .v{font-size:20px}}
 """
@@ -371,12 +383,15 @@ Array.prototype.forEach.call(figs,function(fig){
 METHOD = """
 <ul>
 <li>Prices are the best back / best lay actually on offer in the Betfair PRO order-book data at the alert second, and after 60, 120 and 300 seconds of reaction delay. The last traded price (LTP) is shown for comparison only: it is not a price you can necessarily take.</li>
-<li>Commission is charged on net winnings only (the commission shown in each row); the owner's real rate is the 4.8% case. P/L is per 1 unit of the backer's stake for backs and lays alike; for lays the return on liability (ROL = P/L divided by sum of odds minus 1) is shown as well. The Pinnacle quote row carries no commission.</li>
+<li>Commission is charged on net winnings only (the commission shown in each row); the owner's real rate is the 4.8% case. P/L is per 1 unit of the backer's stake for backs and lays alike; for lays the return on liability (ROL = P/L divided by sum of odds minus 1) is shown as well. The row for the alert's Min. Odds carries no commission.</li>
 <li>Void results are excluded from every ROI, strike rate and count; every excluded alert is counted by reason in headline.csv (column excluded). Alerts placed in-play are excluded from the pre-off legs.</li>
 <li>Nothing observed after the alert time selects or prices an entry. Alerts on the same match are not independent, so every ROI and CLV interval is given i.i.d. and clustered by event (bootstrap over whole events).</li>
 <li>The null p-value is the chance of an ROI at least this good if every selection won with probability 1/odds at the price taken (a fair price), under the same commission.</li>
 <li>Scalping assumes taking the book on both legs (back at the best back then lay at the best lay, or the reverse) and says nothing about queue position or fills for resting orders; the take-profit / stop-loss grid is simulated on last-traded prices.</li>
 <li>Small samples make realised ROI very noisy. Closing-line value (CLV: price taken against the last pre-off traded price) is the lower-noise measure of whether the price taken was good.</li>
+<li>Book legs (best back / best lay, and the book-taker scalps) require a two-sided book at the entry second in which the best lay is no more than 20% above the best back; other alerts are excluded (reason no_tradeable_book). A one-sided offer, or a gap that wide, is a stray order and not a market that can be traded against: pricing a bet at it would produce a number that means nothing.</li>
+<li>Any ROI that rests on fewer than 30 settled bets is labelled "too few bets to conclude": such a figure cannot tell skill from luck, whatever its sign.</li>
+<li>The funnel counts each alert once, at the last step it reached: published (the alert kicks off before the end of the PRO data given to the run), event found on Betfair, the mapped market found, the runner found, a best back priced at the alert second, and a settled (non-void) result.</li>
 <li>Segments: every rule tested is counted; Benjamini-Hochberg (q = 0.10) is applied across the whole table. Segment cut-points (quantile thresholds, quartile bins) are computed on the full leg, a mild look-ahead on the cut-points only. A rule counts as positive only if it survives BH, its clustered ROI interval and its CLV interval are above zero, and it earned a positive ROI in the walk-forward folds where it was picked.</li>
 </ul>
 """
@@ -410,11 +425,84 @@ def _excl(js):
 def _hl_rows(h):
     order = {"book": 0, "ltp": 1, "ref": 2, "close": 3}
     h = h.assign(_o=h["price"].map(order), _s=h["side"].map({"back": 0, "lay": 1})).sort_values(["_o", "_s", "latency_s", "commission"], kind="stable")
-    return [[esc(LEG_LABEL[(r.side, r.price)]), intf(r.latency_s), pct(r.commission), intf(r.n), intf(r.n_events), pct(r.roi), ci(r.roi_ci_lo, r.roi_ci_hi),
+    return [[esc(LEG_LABEL[(r.side, r.price)]), intf(r.latency_s), pct(r.commission), intf(r.n), intf(r.n_events), _few(r.n, pct(r.roi)), ci(r.roi_ci_lo, r.roi_ci_hi),
              ci(r.roi_cl_lo, r.roi_cl_hi), pval(r.p_null), pct(r.strike_rate), num(r.avg_odds), num(r.max_drawdown), pct(r.rol),
              esc(r.note or _excl(r.excluded))] for r in h.itertuples()]
 
 
+def _s(v) -> str:
+    return "" if _na(v) else str(v)
+
+
+def _book(bb, bl) -> str:
+    """The book at the alert: two-sided (with the spread), one-sided or none."""
+    if _na(bb) and _na(bl):
+        return "none"
+    return "one-sided" if _na(bb) or _na(bl) else f"two-sided {pct(bl / bb - 1)}"
+
+
+def _ok_alerts_table(df) -> str:
+    """Every alert that reached a settled-or-not Betfair runner (status ok), oldest first."""
+    rows = []
+    for r in df[df["status"].eq("ok")].sort_values("ts", kind="stable").to_dict("records"):
+        hc, bb = r.get("bf_hc"), r.get("bb_l0")
+        sel = _s(r.get("bf_runner")) + (f" ({hc:g})" if not _na(hc) and hc else "")
+        mo = r.get("min_odds") if not _na(r.get("min_odds")) else r.get("ref_odds")
+        rows.append([esc(ts_both(r["ts"])), esc(_s(r.get("sport"))),
+                     esc(f"{_s(r.get('home_raw')) or _s(r.get('home'))} v {_s(r.get('away_raw')) or _s(r.get('away'))}"),
+                     esc(_s(r.get("bf_event_name"))), esc(_s(r.get("bf_market"))), esc(sel),
+                     "n/a" if _na(bb) else f"{num(bb)} ({num(r.get('bb_l0_size'), 0)})", num(r.get("bl_l0")),
+                     esc(_book(bb, r.get("bl_l0"))), num(mo),
+                     esc(_s(r.get("result_status")).lower() if r.get("result_known") in (True, 1) else "unknown")])
+    head = ["Alert time", "Sport", "Fixture", "Betfair event", "Market", "Selection", "Best back (size)", "Best lay", "Book", "Min. Odds", "Result"]
+    return table(head, rows, left=6) if rows else "<p class='note'>No alert reached a Betfair runner.</p>"
+
+
+def _funnel_sentence(f) -> str:
+    return (f"Of {intf(f.alerts)} alerts, {intf(f.pro_not_published)} kicked off after the published Betfair data ended and were not matched; "
+            f"of the {intf(f.in_coverage)} in coverage, {intf(f.event_on_betfair)} had their event on Betfair, {intf(f.market_found)} had the "
+            f"mapped market, {intf(f.runner_found)} the runner, {intf(f.priced_at_alert)} a best back at the alert time, "
+            f"{intf(f.tradeable_at_alert)} a tradeable two-sided book (best lay within 20% of the best back), and "
+            f"{intf(f.tradeable_and_settled)} were tradeable and settled ({intf(f.priced_and_settled)} priced and settled).")
+
+
+def _min_odds_html(df, commission, cpct):
+    """The blocks of "Against the alert's Min. Odds"; returns (html, numbers for key_numbers.json)."""
+    bbk, gap, rest = A.min_odds_best_back(df), A.min_odds_gap(df), A.resting_order(df, commission)
+    h = ["<p>The alert's own rule is to bet only at its Min. Odds or better. Here it is tested on Betfair twice: taking the best "
+         "back at the alert (blocks a and b), and the exchange-native version of the rule, a resting back order at Min. Odds "
+         "(block c).</p>", "<h3>a. Was Betfair's best back at or above the alert's Min. Odds?</h3>",
+         table(["Delay (s)", "Priced alerts (n)", "Best back at or above Min. Odds (k)", "Share"],
+               [[intf(r.latency_s), intf(r.n), intf(r.k), _few(r.n, pct(r.k / r.n)) if r.n else "n/a"] for r in bbk.itertuples()])]
+    r0 = bbk.iloc[0]
+    h.append("<p>" + _few(r0.n, f"At 0 s the best back was at or above Min. Odds for {intf(r0.k)} of {intf(r0.n)} priced alerts.") + "</p>")
+    st = lambda d: [pct(d["median"]), pct(d["min"]), pct(d["max"])]  # noqa: E731
+    h += ["<h3>b. Tradeable books at the alert (best lay within 20% of the best back)</h3>",
+          table(["Price / Min. Odds - 1", "n", "Median", "Min", "Max"],
+                [["Best back", intf(gap["n"]), _few(gap["n"], st(gap["best_back"])[0]), *st(gap["best_back"])[1:]],
+                 ["Mid price", intf(gap["n"]), _few(gap["n"], st(gap["mid"])[0]), *st(gap["mid"])[1:]]]),
+          "<p>" + _few(gap["n"], f"The best lay was at or above Min. Odds for {intf(gap['lay_ge_min'])} of {intf(gap['n'])} tradeable books.") + "</p>"]
+    h.append("<h3>c. A resting back order at Min. Odds</h3>")
+    if not rest["has_columns"]:
+        h.append("<p class='note'>No resting-order columns in this data (limit_fill, " + esc(rest["column"]) + ").</p>")
+    else:
+        h.append(table(["Orders placed", "With a trade after the alert", "Filled", "Wins", "Strike", f"ROI on filled ({cpct})",
+                        "ROI 95% CI (i.i.d.)"],
+                       [[intf(rest["placed"]), intf(rest["traded"]), intf(rest["filled"]), intf(rest["wins"]), pct(rest["strike_rate"]),
+                         _few(rest["filled"], pct(rest["roi"])), ci(rest["roi_ci_lo"], rest["roi_ci_hi"])]]))
+    h.append("<p class='note'>Placed = every matched, pre-off, settled, non-void alert. A fill means the last traded price reached Min. "
+             "Odds after the alert and before the off: a touch fill that ignores queue position, so it is optimistic. Such an order "
+             "fills exactly when the price drifts out against the alert (the market moving away from the selection), so the fills are "
+             "not a random sample of the alerts.</p>")
+    nums = {"best_back_at_or_above_min": [{"latency_s": int(r.latency_s), "n": int(r.n), "k": int(r.k)} for r in bbk.itertuples()],
+            "tradeable_gap": gap, "resting_order": rest}
+    return "".join(h), nums
+
+
+HEADLINE_LEG = {"book": "Back at the best back of a two-sided book (best lay within 20% of the best back)",
+                "ltp": LEG_LABEL[("back", "ltp")]}
+METHOD_VENDOR = ("<li>\"At bookmaker odds\" uses results taken from the vendor's public results page, which lists only alerts that "
+                 "Bet365 priced at or above the minimum odds; no Betfair price or commission is involved.</li>\n")
 HL_HEAD = ["Leg", "Delay (s)", "Commission", "n", "Events", "ROI", "ROI 95% CI (i.i.d.)", "ROI 95% CI (by event)", "Null p",
            "Strike", "Avg odds", "Max drawdown (units)", "ROL (lays)", "Excluded / note"]
 
@@ -447,7 +535,7 @@ def build_report(enriched: pd.DataFrame, out_dir, commission: float = A.REAL_COM
     ref_leg = _leg(df, "back", "ref", 0, 0.0)
     series_def = [("back", legs["back"], "s1", f"Back at {'best back' if basis == 'book' else 'last traded price'} ({cpct})", "Back"),
                   ("lay", legs["lay"], "s2", f"Lay at {'best lay' if basis == 'book' else 'last traded price'} ({cpct})", "Lay"),
-                  ("ref", ref_leg, "s3", "Back at Pinnacle quote", "Pinnacle")]
+                  ("ref", ref_leg, "s3", LEG_LABEL[("back", "ref")], "Min. Odds")]
     curves = [(key, name, short, cls, A.pl_curve(leg)) for key, leg, cls, name, short in series_def if len(leg)]
 
     # ---- CSVs / JSON
@@ -471,6 +559,13 @@ def build_report(enriched: pd.DataFrame, out_dir, commission: float = A.REAL_COM
     cur_all = (pd.concat([c[4].assign(series=c[1]) for c in curves], ignore_index=True)[["series", "ts", "pl", "cum_pl"]]
                if curves else pd.DataFrame(columns=["series", "ts", "pl", "cum_pl"]))
     put("pl_curve.csv", cur_all)
+    funnel = A.funnel_table(df)
+    put("funnel.csv", funnel)
+    put("min_odds_check.csv", A.min_odds_check(df, commission))
+    min_odds_html, min_odds_nums = _min_odds_html(df, commission, cpct)
+    has_vendor = "own_pl_min" in df
+    if has_vendor:
+        put("vendor_join.csv", df[[c for c in ["alert_id", *VENDOR_JOIN_COLS, "check_status", "selection_raw", "min_odds"] if c in df]])
 
     # ---- numbers
     hrow = hl[(hl.side == "back") & (hl.price == basis) & (hl.latency_s == 0) & np.isclose(hl.commission, commission)].iloc[0]
@@ -480,13 +575,14 @@ def build_report(enriched: pd.DataFrame, out_dir, commission: float = A.REAL_COM
     n_tests = {s: int(seg[s].attrs.get("n_tests", 0)) for s in seg}
     key = {"label": label, "n_alerts_input": n_in, "n_ok": n_ok, "match_rate": n_ok / n_in if n_in else None,
            "status_counts": {str(k): int(v) for k, v in df["status"].value_counts(dropna=False).items()},
-           "commission": commission, "segment_price_basis": basis, "headline_leg": f"{LEG_LABEL[('back', basis)]}, delay 0 s, commission {cpct}",
+           "commission": commission, "segment_price_basis": basis, "headline_leg": f"{HEADLINE_LEG[basis]}, delay 0 s, commission {cpct}",
            "headline_n": int(hrow.n), "headline_n_events": int(hrow.n_events), "headline_roi": hrow.roi,
            "headline_roi_ci_iid": [hrow.roi_ci_lo, hrow.roi_ci_hi], "headline_roi_ci_clustered": [hrow.roi_cl_lo, hrow.roi_cl_hi],
            "headline_p_null": hrow.p_null, "headline_clv_mean": hrow.clv_mean, "headline_clv_ci": [hrow.clv_ci_lo, hrow.clv_ci_hi],
            "headline_clv_n": int(hrow.clv_n), "first_alert_utc": None if pd.isna(t_first) else t_first.isoformat(),
            "last_alert_utc": None if pd.isna(t_last) else t_last.isoformat(), "n_review_rows": int(len(review)),
            "n_rules_tested": n_tests, "n_bh_pass": {s: int(seg[s]["bh_pass"].sum()) for s in seg},
+           "funnel": {k: (v if k == "sport" else int(v)) for k, v in funnel.iloc[-1].items()}, "min_odds": min_odds_nums,
            "n_rules_positive": len(positives), "any_positive_rule": bool(positives),
            "positive_rules": [f"{s}: {r.rule}" for s, r in positives], "features_skipped": df.attrs.get("features_skipped", [])}
     (out / "key_numbers.json").write_text(json.dumps(_clean(key), indent=1), encoding="utf-8")
@@ -495,12 +591,33 @@ def build_report(enriched: pd.DataFrame, out_dir, commission: float = A.REAL_COM
     nothing = n_ok == 0
     nothing_p = '<p class="note">Nothing to analyse: no alert was matched to a Betfair runner with a result.</p>'
     b = []
-    # 1 summary
+    sec = iter(range(1, 100))
+    h2 = lambda t: f"<h2>{next(sec)}. {esc(t)}</h2>"  # noqa: E731
     b.append(f"<h1>ShootingBets alerts vs Betfair Exchange</h1><p class='sub'>Generated {esc(ts_both(pd.Timestamp.now(tz='UTC')))}</p>")
-    b.append("<h2>1. Summary</h2>")
+    # funnel
+    b.append(h2("Could these alerts be bet on Betfair?"))
+    b.append(table(A.FUNNEL_COLS, [[esc(r.sport)] + [intf(getattr(r, c)) for c in A.FUNNEL_COLS[1:]] for r in funnel.itertuples()]))
+    b.append(f"<p>{esc(_funnel_sentence(funnel.iloc[-1]))}</p>")
+    if funnel.iloc[-1].pro_not_published:
+        b.append(f"<p>{intf(funnel.iloc[-1].pro_not_published)} alerts kick off after the last published Betfair PRO month; "
+                 "they can be priced once Betfair publishes it.</p>")
+    b.append("<h3>Alerts matched to a Betfair runner</h3>" + _ok_alerts_table(df))
+    if has_vendor:
+        vt = A.vendor_table(df)
+        b.append(h2("At bookmaker odds (vendor-scored alerts)"))
+        b.append(table(["Leg", "n", "Strike", "Avg odds", "ROI", "ROI 95% CI (i.i.d.)", "Null p"],
+                       [[esc(r.leg), intf(r.n), pct(r.strike_rate), num(r.avg_odds), _few(r.n, pct(r.roi)),
+                         ci(r.roi_ci_lo, r.roi_ci_hi), pval(r.p_null)] for r in vt.itertuples()]))
+        b.append("<p class='note'>Results come from the vendor's public results page. It lists only alerts for which Bet365 offered at "
+                 "least the minimum odds (the \"Checked\" alerts), so every unchecked alert is missing. The second row's line is "
+                 "Bet365's and can differ from the alert's own line. No commission; no Betfair price is involved. "
+                 "File: <code>vendor_join.csv</code>.</p>")
+    b.append(h2("Against the alert's Min. Odds"))
+    b.append(min_odds_html)
+    b.append(h2("Summary"))
     tiles = [_tile("Alerts in", intf(n_in)), _tile("Matched ok", intf(n_ok), pct(key["match_rate"]) + " of alerts"),
              _tile("Bets in the headline leg", intf(hrow.n), esc(f"{hrow.n_events:.0f} events" if hrow.n else "no bets after exclusions")),
-             _tile("Headline ROI", pct(hrow.roi), f"clustered 95% CI {ci(hrow.roi_cl_lo, hrow.roi_cl_hi)}"),
+             _tile("Headline ROI", _few(hrow.n, pct(hrow.roi)), f"clustered 95% CI {ci(hrow.roi_cl_lo, hrow.roi_cl_hi)}"),
              _tile("Mean CLV vs close", pct(hrow.clv_mean), f"95% CI {ci(hrow.clv_ci_lo, hrow.clv_ci_hi)}; n={intf(hrow.clv_n)}"),
              _tile("Alert date span", "" if pd.isna(t_first) else f"{t_first:%Y-%m-%d} to {t_last:%Y-%m-%d}",
                    esc(ts_both(t_first)) + "<br>to " + esc(ts_both(t_last)))]
@@ -512,26 +629,26 @@ def build_report(enriched: pd.DataFrame, out_dir, commission: float = A.REAL_COM
     if not has_book and not nothing:
         b.append("<p><strong>No order-book prices in this data:</strong> the strategy tables, walk-forward and verdict fall back to the last traded price (LTP) legs.</p>")
     # 2 matching
-    b.append("<h2>2. Matching</h2>")
+    b.append(h2("Matching"))
     m_rows = [[esc(r.sport), esc(r.bf_market), esc(r.status), intf(r.n), pct(r.share)] for r in summary.itertuples()]
-    b.append(table(["Sport", "Market", "Status", "n", "Share"], m_rows[:80], left=3))
+    b.append(table(["Sport", "Market", "Status", "n", "Share"], m_rows[:200], left=3))
     b.append(f"<p>{len(review)} alert(s) need review (not matched, ambiguous, score below 85, kickoff gap above 5 minutes, or home/away swapped). "
              f"Files: <code>match_summary.csv</code>, <code>match_review.csv</code>, <code>match_spotcheck.csv</code> (up to 20 random matched alerts next to the Betfair event and runner).</p>")
     # 3 headline
-    b.append("<h2>3. Headline ROI</h2>")
+    b.append(h2("Headline ROI"))
     sel = hl[np.isclose(hl.commission, commission) | hl.price.isin(["ref", "close"])]
     b.append(f"<p class='sub'>Commission {cpct} on net winnings. ROI is the mean P/L per bet (per 1 unit of backer's stake). The null p is one-sided: the chance of an ROI this good at fair prices.</p>")
     b.append(table(HL_HEAD, _hl_rows(sel)))
     b.append(f"<details><summary>All commission levels ({len(hl)} rows)</summary>{table(HL_HEAD, _hl_rows(hl))}</details>")
     # 4 cumulative
-    b.append("<h2>4. Cumulative P/L</h2>")
+    b.append(h2("Cumulative P/L"))
     if curves:
         b.append(cum_chart([{"name": n, "short": sh, "cls": c, "t": A._to_ms(cv["ts"]), "y": cv["cum_pl"].to_numpy(float)}
                             for _, n, sh, c, cv in curves], "Cumulative P/L by alert time (units of backer's stake)"))
     else:
         b.append(nothing_p)
     # 5 CLV
-    b.append("<h2>5. CLV (closing-line value)</h2>")
+    b.append(h2("CLV (closing-line value)"))
     b.append("<p class='sub'>CLV = price taken / last pre-off traded price - 1 for backs (the reverse ratio for lays); above zero means the price beat the close.</p>")
     cl = sel[sel.n > 0] if len(sel) else sel
     order = {"book": 0, "ltp": 1, "ref": 2, "close": 3}
@@ -540,26 +657,28 @@ def build_report(enriched: pd.DataFrame, out_dir, commission: float = A.REAL_COM
               for r in cl.itertuples()]
     b.append(table(["Leg", "Delay (s)", "n with a close", "Mean CLV", "95% CI (by event)", "Beat the close"], c_rows) if c_rows else nothing_p)
     # 6 event study
-    b.append("<h2>6. Event study</h2>")
+    b.append(h2("Event study"))
     if len(es) and es["n"].sum():
         b.append(es_chart(es, "Last traded price versus the price at the alert, in ticks (pre-off alerts)"))
     else:
         b.append(nothing_p)
     # 7 strategies
-    b.append("<h2>7. Strategies</h2>")
+    b.append(h2("Strategies"))
     b.append(f"<p>Legs tested: {esc(LEG_LABEL[('back', basis)].lower())} and {esc(LEG_LABEL[('lay', basis)].lower())}, delay 0 s, commission {cpct}"
-             + ("" if has_book else " (LTP fallback: no order-book prices)") + ".</p>")
+             + (" (two-sided books only: best lay within 20% of the best back)" if has_book
+                else " (LTP fallback: no order-book prices)") + ".</p>")
     w_rows = []
     for s in ("back", "lay"):
         w = wf[s]
         if "skipped" in w:
-            wtxt, oos, base = f"not run: {w['skipped']} (n = {w['n']})", "n/a", "n/a"
+            wtxt, oos, base, oos_n, base_n = f"not run: {w['skipped']} (n = {w['n']})", "n/a", "n/a", 0, 0
         else:
             o, bs = w.get("oos"), w.get("baseline_all_oos")
+            oos_n, base_n = (o or {}).get("n", 0), (bs or {}).get("n", 0)
             wtxt = f"{sum(1 for p in w['picks'] if p.get('rule'))} of {len(w['picks'])} folds picked a rule; {w['n_rules']} candidate rules"
             oos = "n/a" if not o else f"{pct(o['roi'])} {ci(o['roi_ci_lo'], o['roi_ci_hi'])}, n={o['n']}"
             base = "n/a" if not bs else f"{pct(bs['roi'])}, n={bs['n']}"
-        w_rows.append([esc(s), intf(len(legs[s])), intf(n_tests[s]), intf(key["n_bh_pass"][s]), esc(wtxt), esc(oos), esc(base)])
+        w_rows.append([esc(s), intf(len(legs[s])), intf(n_tests[s]), intf(key["n_bh_pass"][s]), esc(wtxt), _few(oos_n, esc(oos)), _few(base_n, esc(base))])
     b.append(table(["Side", "Bets", "Rules tested", "BH survivors (q=0.10)", "Walk-forward", "Out-of-sample ROI [95% CI]", "All bets, same folds"], w_rows))
     skipped = {s: seg[s].attrs.get("skipped", []) for s in seg}
     if any(skipped.values()):
@@ -571,14 +690,14 @@ def build_report(enriched: pd.DataFrame, out_dir, commission: float = A.REAL_COM
         b.append("<div class='verdict'><strong>No rule met all four criteria</strong> (Benjamini-Hochberg survivor at q = 0.10, clustered ROI interval above zero, "
                  "CLV interval above zero, and a positive out-of-sample walk-forward ROI), so none of the segments tested can be called a positive strategy.</div>")
     if len(vall):
-        v_rows = [[esc(r.side), esc(r.rule), intf(r.n), pct(r.roi), pct(r.roi_cl_lo), pval(r.p_null), "yes" if r.bh_pass else "no", pct(r.clv_mean),
-                   pct(r.clv_ci_lo), "yes" if r.oos_selected else "no", pct(r.oos_roi), "<strong>YES</strong>" if r.positive else "no"] for r in vall.head(30).itertuples()]
+        v_rows = [[esc(r.side), esc(r.rule), intf(r.n), _few(r.n, pct(r.roi)), pct(r.roi_cl_lo), pval(r.p_null), "yes" if r.bh_pass else "no", pct(r.clv_mean),
+                   pct(r.clv_ci_lo), "yes" if r.oos_selected else "no", _few(r.oos_n, pct(r.oos_roi)), "<strong>YES</strong>" if r.positive else "no"] for r in vall.head(30).itertuples()]
         b.append(f"<p>Verdict table (rules with a BH pass, or ROI above zero with n of at least 30); showing {len(v_rows)} of {len(vall)} - full table in <code>verdict.csv</code>.</p>")
         b.append(table(["Side", "Rule", "n", "ROI", "ROI lower (by event)", "Null p", "BH pass", "CLV mean", "CLV lower", "Picked OOS", "OOS ROI", "Positive"], v_rows, left=2))
     else:
         b.append("<p>No rule had a BH pass or a positive ROI with enough bets, so the verdict table is empty.</p>")
     # 8 scalping
-    b.append("<h2>8. Scalping</h2>")
+    b.append(h2("Scalping"))
     book_fx = fixed[fixed.basis == "book"]
     ltp_fx = fixed[(fixed.basis == "ltp") & (fixed.pen == 0)]
     bar_src, bnote = (book_fx, "Taker on the book at both legs (back at the best back, lay at the best lay, or the reverse). Whiskers = 95% CI by event.") if len(book_fx) else \
@@ -599,7 +718,7 @@ def build_report(enriched: pd.DataFrame, out_dir, commission: float = A.REAL_COM
     b.append("<h3>Take-profit / stop-loss (ticks, last-traded-price simulation)</h3>" +
              (table(["Direction", "TP", "SL", "Spread pen.", "n", "Missing", "Mean green", "95% CI (by event)", "Profitable", "TP", "SL", "Time", "Off", "No exit"], t_rows) if t_rows else nothing_p))
     # 9 method
-    b.append("<h2>9. Method and caveats</h2>" + METHOD)
+    b.append(h2("Method and caveats") + (METHOD.replace("</ul>", METHOD_VENDOR + "</ul>") if has_vendor else METHOD))
     title = f"{label} - ShootingBets ROI report" if label else "ShootingBets ROI report"
     (out / "report.html").write_text(_page(title, label, "".join(b)), encoding="utf-8")
     return _clean(key)

@@ -10,7 +10,7 @@ Input: a DataFrame of *parsed* alerts with (at least) these columns
     sel_kind      home | away | draw | over | under | yes | no | team | ...
     sel_team      optional team name for 'team' selections
     sel_hc        optional handicap / line for handicap markets
-    ref_odds      optional reference odds quoted in the alert (e.g. Pinnacle after the drop)
+    ref_odds      optional reference odds quoted in the alert (the alert's Min. Odds)
 Other columns are carried through untouched (useful as strategy features).
 
 Executable order-book columns (ADVANCED/PRO data; "x" prefix = taker on the book; NaN without a book):
@@ -19,6 +19,15 @@ Executable order-book columns (ADVANCED/PRO data; "x" prefix = taker on the book
     bl_l{L}, bl_l{L}_size       best lay (price a LAYER can take) and its size
     bb_l0_age_min, bl_l0_age_min  staleness of those book observations at L=0
     spread_ticks_l0, tv_l0      ladder ticks bb_l0 -> bl_l0; traded volume at the alert
+    book_ok_l{L}, spread_pct_l0 a TRADEABLE book at L seconds: both sides present and best lay / best back - 1 <= 20%
+                                (a stray one-sided offer is not a market); spread_pct_l0 = bl_l0 / bb_l0 - 1
+    max_ltp_after, n_trades_after, limit_fill, limit_pl_{ctag}
+                                a resting back order at the alert's Min. Odds (ref_odds), pre-off alerts only: the highest
+                                last traded price strictly after the alert and strictly before the off, how many trades,
+                                whether it reached ref_odds (a touch fill), and the back P/L at ref_odds when filled
+    tick_ladder                 "fine" for an ASIAN_HANDICAP* betting type (finer ladder than sbroi/ticks.py models: no
+                                tick columns: spread_ticks_l0, es_*, fx_*, tp_* stay NaN/absent), else "classic"
+    match_names                 "primary" (home/away) or "alt" (home_alt/away_alt, tried when the first names found no event)
     bb_close, bl_close          last pre-off book (off - 1 ms)
     xback_pl_l{L}_{ctag}        P/L backing at bb_l{L};  xlay_pl_l{L}_{ctag}  laying at bl_l{L}
     xclose_back_pl_c0, xclose_lay_pl_c0   same at the pre-off close, no commission
@@ -40,6 +49,7 @@ from .scalping import book_fixed_horizon, event_study, fixed_horizon, tp_sl
 from .ticks import tick_diff
 
 MIN = 60_000
+MAX_SPREAD_FRAC = 0.20   # a book leg needs a two-sided book whose best lay is at most this far above the best back
 
 
 @dataclass
@@ -48,6 +58,9 @@ class Config:
     latencies_s: tuple[int, ...] = (0, 60, 120, 300)      # reaction delay after the alert
     max_ltp_age_min: float = 30.0                          # older last-trade => flag as stale
     kickoff_window_min: float = 20.0
+    kickoff_window_by_sport: dict = field(default_factory=lambda: {"Tennis": 720.0})  # tennis order-of-play times drift
+    max_spread_frac: float = MAX_SPREAD_FRAC               # book_ok_l{L}: best lay / best back - 1 at most this
+    coverage_end_ms: int | None = None                     # alerts kicking off at/after this: "pro_not_published"
     event_offsets_min: tuple[int, ...] = (-120, -60, -30, -15, -5, -2, -1, 0, 1, 2, 5, 10, 15, 30, 60, 120, 240)
     horizons_min: tuple[int, ...] = (1, 2, 5, 10, 15, 30, 60, 120, 240, 100000)  # 100000 = hold to the off
     tp_ticks: tuple[int, ...] = (1, 2, 3, 5)
@@ -78,6 +91,16 @@ def _ms(ts) -> int | None:
     return int(round(t.timestamp() * 1000))
 
 
+def _book_ok(bb: float, bl: float, max_frac: float) -> bool:
+    """Both sides present and the best lay at most ``max_frac`` above the best back (a missing side is NaN, which compares
+    False; 1e-9 absorbs float noise, so a spread of exactly 20% passes)."""
+    return bool(bl / bb - 1 <= max_frac + 1e-9)
+
+
+def _name(v) -> str | None:
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
 def _pick_market(markets: dict[str, MarketRecord], ev: EventInfo, mtype: str) -> MarketRecord | None:
     ids = find_markets(ev, mtype)
     if not ids:
@@ -94,20 +117,37 @@ def enrich(alerts: pd.DataFrame, markets: dict[str, MarketRecord], index: dict[s
     for a in alerts.itertuples(index=False):
         a = a._asdict()
         out = dict(a)
-        t_alert = _ms(a["ts"])
-        em = match_event(index, a.get("sport"), a.get("home") or "", a.get("away") or "",
-                         kickoff_ms=_ms(a.get("kickoff")), alert_ms=t_alert,
-                         window_min=cfg.kickoff_window_min)
-        out.update(match_event_id=em.event_id, match_score=em.score, match_home=em.home_score,
-                   match_away=em.away_score, match_runner_up=em.runner_up_score, match_swapped=em.swapped,
-                   match_dt_min=em.time_diff_min, match_reason=em.reason)
+        t_alert, t_kick = _ms(a["ts"]), _ms(a.get("kickoff"))
+        if cfg.coverage_end_ms is not None and t_kick is not None and t_kick >= cfg.coverage_end_ms:
+            out["status"] = "pro_not_published"          # the PRO files do not reach this kickoff: nothing to match
+            rows.append(out)
+            continue
+        sport = a.get("sport")
+        win = cfg.kickoff_window_by_sport.get(sport, cfg.kickoff_window_min)
+        em = match_event(index, sport, a.get("home") or "", a.get("away") or "",
+                         kickoff_ms=t_kick, alert_ms=t_alert, window_min=win)
+        names = "primary"
+        if em.event_id is None and _name(a.get("home_alt")) and _name(a.get("away_alt")):
+            em2 = match_event(index, sport, _name(a["home_alt"]), _name(a["away_alt"]),
+                              kickoff_ms=t_kick, alert_ms=t_alert, window_min=win)
+            if em2.event_id is not None:
+                em, names = em2, "alt"
+        out.update(match_names=names if em.event_id is not None else None, match_event_id=em.event_id,
+                   match_score=em.score, match_home=em.home_score, match_away=em.away_score,
+                   match_runner_up=em.runner_up_score, match_swapped=em.swapped, match_dt_min=em.time_diff_min,
+                   match_reason=em.reason)
         if em.event_id is None:
             out["status"] = "no_event_match"
             rows.append(out)
             continue
         ev = index[em.event_id]
         out.update(bf_event_name=ev.event_name, bf_country=ev.country_code)
-        m = _pick_market(markets, ev, a.get("bf_market"))
+        bf_market = a.get("bf_market")
+        if bf_market is None or pd.isna(bf_market) or not str(bf_market).strip():
+            out["status"] = "unmapped_market"
+            rows.append(out)
+            continue
+        m = _pick_market(markets, ev, bf_market)
         if m is None:
             out["status"] = "no_market"
             rows.append(out)
@@ -116,8 +156,11 @@ def enrich(alerts: pd.DataFrame, markets: dict[str, MarketRecord], index: dict[s
         hc = None if hc is None or (isinstance(hc, float) and np.isnan(hc)) else float(hc)
         kind = a.get("sel_kind")
         # if the alert's home/away order was swapped relative to Betfair, swap home/away selections
-        if em.swapped and kind in ("home", "away"):
-            kind = "away" if kind == "home" else "home"
+        if em.swapped:
+            kind = {"home": "away", "away": "home", "home_or_draw": "draw_or_away",
+                    "draw_or_away": "home_or_draw"}.get(kind, kind)
+        fine = (m.betting_type or "").startswith("ASIAN_HANDICAP")  # finer price ladder than sbroi/ticks.py: no tick arithmetic
+        out["tick_ladder"] = "fine" if fine else "classic"
         r = resolve_runner(m, ev, kind, team=a.get("sel_team"), handicap=hc, sport=a.get("sport"))
         if r is None:
             out["status"] = "no_runner"
@@ -162,13 +205,15 @@ def enrich(alerts: pd.DataFrame, markets: dict[str, MarketRecord], index: dict[s
             for L, b in bk.items():
                 for k in ("bb", "bl"):
                     out[f"{k}_l{L}"], out[f"{k}_l{L}_size"] = b[k], b[f"{k}_size"]
+                out[f"book_ok_l{L}"] = _book_ok(b["bb"], b["bl"], cfg.max_spread_frac)
             b0 = book_at(r, t_alert)
             tv = traded_volume_at(r, t_alert)
             bc = book_at(r, off - 1) if off else {"bb": np.nan, "bl": np.nan}
             both = not (np.isnan(b0["bb"]) or np.isnan(b0["bl"]))
             out.update(has_book=bool(r.bb_t or r.bl_t), bb_l0_age_min=b0["bb_age_ms"] / MIN,
                        bl_l0_age_min=b0["bl_age_ms"] / MIN, tv_l0=np.nan if tv is None else tv,
-                       spread_ticks_l0=tick_diff(b0["bb"], b0["bl"]) if both else np.nan,
+                       spread_ticks_l0=tick_diff(b0["bb"], b0["bl"]) if both and not fine else np.nan,
+                       spread_pct_l0=b0["bl"] / b0["bb"] - 1 if both else np.nan,
                        bb_close=bc["bb"], bl_close=bc["bl"])
             if oc.known:
                 for L, b in bk.items():
@@ -185,8 +230,19 @@ def enrich(alerts: pd.DataFrame, markets: dict[str, MarketRecord], index: dict[s
                         tr = book_fixed_horizon(r, t_alert, h * MIN, off, side, cfg.scalp_commission)
                         out[f"xfx_{side}_h{h}"] = tr.green_pl
                         out[f"xfx_{side}_h{h}_reason"] = tr.exit_reason
+        # a resting back order at the alert's Min. Odds (ref_odds): did the last traded price reach it before the off?
+        ref = a.get("ref_odds")
+        if ref is not None and not pd.isna(ref) and not out["in_play_at_alert"]:
+            t, p = np.asarray(r.ltp_t), np.asarray(r.ltp_p, float)
+            after = (t > t_alert) & (t < (off if off else np.inf))
+            out["n_trades_after"] = int(after.sum())
+            out["max_ltp_after"] = float(p[after].max()) if after.any() else np.nan
+            out["limit_fill"] = bool(out["max_ltp_after"] >= float(ref))     # equality fills; no trade (NaN) does not
+            for c in cfg.commissions:
+                out[f"limit_pl_{_ctag(c)}"] = (back_pl(float(ref), oc, c) if out["limit_fill"] and oc.known and not oc.void
+                                               else np.nan)
         # event study (relative tick level vs t_alert)
-        if not np.isnan(p0) and not out["in_play_at_alert"]:
+        if not np.isnan(p0) and not out["in_play_at_alert"] and not fine:
             es = event_study(r, t_alert, [o * MIN for o in cfg.event_offsets_min], off)
             for o in cfg.event_offsets_min:
                 out[f"es_{o}"] = es.get(o * MIN)

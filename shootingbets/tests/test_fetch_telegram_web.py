@@ -17,6 +17,7 @@ _spec.loader.exec_module(web)
 
 TS = 1790825415  # 2026-10-01T03:30:15Z
 CHAT = {"id": 777, "username": "ShootingBetsBot", "first_name": "ShootingBets", "bot": True}
+AUTH_ERR = {"__error__": '{"code":401,"type":"AUTH_KEY_UNREGISTERED"}'}  # what the page returns for an unauthorised call
 
 
 def u16(s):
@@ -29,10 +30,13 @@ def raw(i, text="hello", **kw):
 
 
 class FakeTab:
-    """Answers by substring of the JS expression; ``pages`` maps offset_id -> list of raw messages."""
+    """Answers by substring of the JS expression; ``pages`` maps offset_id -> list of raw messages. DevTools calls and
+    reopen() are recorded in ``calls`` too (prefixed DEVTOOLS / REOPEN) so the logout order can be asserted.
+    ``relogin``: the reopened page is logged in again (storage not wiped); ``dc_fails``: help.getNearestDc is rejected."""
 
-    def __init__(self, logged_in=True, pages=None, errors=None):
+    def __init__(self, logged_in=True, pages=None, errors=None, relogin=False, dc_fails=False):
         self.logged_in, self.pages, self.errors, self.calls, self.closed = logged_in, pages or {}, errors or {}, [], False
+        self.relogin, self.dc_fails = relogin, dc_fails
 
     def evaluate(self, expr):
         self.calls.append(expr)
@@ -40,7 +44,7 @@ class FakeTab:
             if key in expr:
                 return json.dumps({"__error__": err})
         if "users.getUsers" in expr:
-            return json.dumps([{"_": "user", "id": 1}] if self.logged_in else [])
+            return json.dumps([{"_": "user", "id": 1}]) if self.logged_in else json.dumps(AUTH_ERR)
         if "contacts.resolveUsername" in expr:
             return json.dumps(CHAT)
         if "messages.getHistory" in expr:
@@ -48,11 +52,19 @@ class FakeTab:
         if "auth.logOut" in expr:
             self.logged_in = False
             return json.dumps({"_": "auth.loggedOut"})
-        if "location.reload" in expr:
-            return None
+        if "help.getNearestDc" in expr:
+            return json.dumps({"__error__": '{"type":"NETWORK_DOWN"}'} if self.dc_fails else {"_": "nearestDc"})
         if "typeof (window.rootScope" in expr:
             return True
         raise AssertionError("unexpected expression: " + expr[:80])
+
+    def call(self, method, params=None):
+        self.calls.append(f"DEVTOOLS {method} {json.dumps(params)}")
+        return {}
+
+    def reopen(self, url):
+        self.calls.append(f"REOPEN {url}")
+        self.logged_in = self.relogin
 
     def close(self):
         self.closed = True
@@ -105,6 +117,8 @@ def test_mapping_edit_service_and_sender():
     assert svc["type"] == "service" and svc["text"] == "" and svc["from_id"] == "user777"  # peer_id fallback
     out = web.export_raw(raw(4, out=True), "ShootingBets")
     assert out["from"] == "me" and web.export_raw(raw(4), "ShootingBets")["from"] == "ShootingBets"
+    assert web.export_raw(raw(4, pFlags={"out": True}), "ShootingBets")["from"] == "me"     # the real TL form
+    assert web.export_raw(raw(4, pFlags={}), "ShootingBets")["from"] == "ShootingBets"
 
 
 # ----------------------------------------------------------------------------- pagination
@@ -141,7 +155,10 @@ def test_js_calls_keep_access_hash_in_the_page():
 
 class FakeWS:
     def __init__(self, replies):
-        self.sent, self.replies = [], list(replies)
+        self.sent, self.replies, self.closed = [], list(replies), False
+
+    def close(self):
+        self.closed = True
 
     def send(self, s):
         self.sent.append(json.loads(s))
@@ -165,6 +182,51 @@ def test_tab_evaluate_protocol():
         t.evaluate("x")
     with pytest.raises(RuntimeError, match="Cannot find context"):
         t.evaluate("y")
+    t.ws.replies.append({"id": 4, "result": {}})
+    assert t.call("Storage.clearDataForOrigin", {"origin": "o", "storageTypes": "all"}) == {}
+    assert t.ws.sent[-1] == {"id": 4, "method": "Storage.clearDataForOrigin",
+                             "params": {"origin": "o", "storageTypes": "all"}}
+
+
+def test_tab_reopen_closes_then_opens_a_new_tab_over_http(monkeypatch):
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def _reply(self, body):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            seen.append(("GET", self.path))
+            self._reply(json.dumps([{"type": "page", "id": "T1", "url": "https://web.telegram.org/k/",
+                                     "webSocketDebuggerUrl": "ws://x/1"}]).encode() if self.path == "/json/list"
+                        else b"Target is closing")
+
+        def do_PUT(self):
+            seen.append(("PUT", self.path))
+            self._reply(json.dumps({"id": "T2", "type": "page", "webSocketDebuggerUrl": "ws://x/2"}).encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    made = []
+    monkeypatch.setattr(web.websocket, "create_connection", lambda url, **kw: made.append(url) or FakeWS([]))
+    for k in ("HTTP_PROXY", "http_proxy"):  # a dead proxy in the environment must not matter: DevTools is local
+        monkeypatch.setenv(k, "http://127.0.0.1:9")
+    w = importlib.util.module_from_spec(_spec)   # a fresh copy, imported AFTER the proxy variable was set
+    _spec.loader.exec_module(w)
+    try:
+        t = w.Tab(srv.server_address[1])
+        old_ws = t.ws
+        assert (t.port, t.target_id) == (srv.server_address[1], "T1")
+        t.reopen(w.START_URL)
+    finally:
+        srv.shutdown()
+    assert seen == [("GET", "/json/list"), ("GET", "/json/close/T1"), ("PUT", "/json/new?https://web.telegram.org/k/")]
+    assert made == ["ws://x/1", "ws://x/2"] and t.target_id == "T2" and old_ws.closed and t.ws is not old_ws
 
 
 def test_tab_discovery_failures():
@@ -213,7 +275,7 @@ def test_api_error_is_raised_and_main_reports_it(tmp_path, monkeypatch, capsys):
 
 
 def test_main_writes_loadable_export_without_printing_texts(tmp_path, monkeypatch, capsys):
-    pages = {0: [raw(5, "SECRETTEXT five", out=True), {"_": "messageEmpty", "id": 4}, raw(3, "SECRETTEXT three")],
+    pages = {0: [raw(5, "SECRETTEXT five", pFlags={"out": True}), {"_": "messageEmpty", "id": 4}, raw(3, "SECRETTEXT three")],
              3: [{"_": "messageService", "id": 2, "date": TS + 2, "peer_id": {"_": "peerUser", "user_id": 777},
                   "action": {"_": "messageActionChatCreate"}}, raw(1, "SECRETTEXT one", edit_date=TS + 60)]}
     tab = FakeTab(pages=pages)
@@ -230,27 +292,88 @@ def test_main_writes_loadable_export_without_printing_texts(tmp_path, monkeypatc
     got = load_export(str(out))
     assert [m.msg_id for m in got] == [1, 3, 5] and got[0].edited_utc == datetime.fromtimestamp(TS + 60, tz=timezone.utc)
     assert tab.offsets() == [0, 3, 1] and [m.msg_id for m in (load_export(str(out), include_service=True))] == [1, 2, 3, 5]
-    # --limit keeps the oldest N
+    # the raw TL messages are saved beside --out, atomically (no .tmp left), without the bot flag / access hash
+    rawf = out.parent / "shootingbets_raw.json"
+    saved = json.loads(rawf.read_text(encoding="utf-8"))
+    assert saved["chat"] == {"id": 777, "username": "ShootingBetsBot", "first_name": "ShootingBets"}
+    assert saved["fetched_utc"] == doc["fetched_utc"] and [m["id"] for m in saved["messages"]] == [1, 2, 3, 5]
+    assert saved["messages"][3]["pFlags"] == {"out": True} and not list(out.parent.glob("*.tmp"))
+    assert f"raw written: {rawf}" in cap.out
+    # --from-raw: same export without any browser
+    monkeypatch.setattr(web, "Tab", lambda port: pytest.fail("no browser expected"))
+    out2 = tmp_path / "again" / "e.json"
+    assert web.main(["--from-raw", str(rawf), "--out", str(out2)]) == 0
+    assert json.loads(out2.read_text(encoding="utf-8")) == doc and "SECRETTEXT" not in capsys.readouterr().out
+    assert web.main(["--from-raw", str(rawf), "--out", str(out2), "--limit", "2"]) == 0
+    assert [m["id"] for m in json.loads(out2.read_text(encoding="utf-8"))["messages"]] == [1, 2]
+    (tmp_path / "nochat.json").write_text('{"messages": []}', encoding="utf-8")
+    capsys.readouterr()
+    for bad in (tmp_path / "missing.json", tmp_path / "nochat.json"):
+        assert web.main(["--from-raw", str(bad), "--out", str(out2)]) == 1
+    assert "failed:" in capsys.readouterr().out
+    # --limit keeps the oldest N, and does NOT overwrite the raw file unless --raw-out is explicit
+    monkeypatch.setattr(web, "Tab", lambda port: tab)
     assert web.main(["--out", str(out), "--page-size", "3", "--pause", "0", "--limit", "2"]) == 0
     assert [m["id"] for m in json.loads(out.read_text(encoding="utf-8"))["messages"]] == [1, 2]
+    assert json.loads(rawf.read_text(encoding="utf-8")) == saved
+    explicit = tmp_path / "r" / "x.json"
+    assert web.main(["--out", str(out), "--raw-out", str(explicit), "--page-size", "3", "--pause", "0", "--limit", "2"]) == 0
+    assert [m["id"] for m in json.loads(explicit.read_text(encoding="utf-8"))["messages"]] == [1, 2]
 
 
-def test_logout_calls_auth_logout_and_confirms(monkeypatch, capsys):
+def test_is_logged_in_only_false_on_an_authorisation_error():
+    assert web.is_logged_in(FakeTab()) is True
+    for err in ('{"code":401,"type":"AUTH_KEY_UNREGISTERED"}', '{"type":"SESSION_REVOKED"}', '{"type":"USER_DEACTIVATED"}',
+                '{"type":"X","code":401}'):
+        assert web.is_logged_in(FakeTab(errors={"users.getUsers": err})) is False
+    for err in ('{"type":"JS_TIMEOUT"}', '{"type":"FLOOD_WAIT_5","code":420}'):  # a hung / failing page is NOT 'logged out'
+        with pytest.raises(web.ApiError, match="JS_TIMEOUT|FLOOD_WAIT_5"):
+            web.is_logged_in(FakeTab(errors={"users.getUsers": err}))
+
+
+def test_hung_page_is_a_failure_not_a_logged_out_verdict(monkeypatch, capsys):
+    tab = FakeTab(errors={"users.getUsers": '{"type":"JS_TIMEOUT"}'})
+    monkeypatch.setattr(web, "Tab", lambda port: tab)
+    assert web.main([]) == 1
+    out = capsys.readouterr().out
+    assert "JS_TIMEOUT" in out and "failed:" in out and web.NOT_LOGGED_IN not in out
+    assert web.main(["--logout"]) == 1 and not any("auth.logOut" in c or c.startswith(("DEVTOOLS", "REOPEN")) for c in tab.calls)
+    assert "failed:" in capsys.readouterr().out
+
+
+def test_logout_sequence_and_proof(monkeypatch, capsys):
     tab = FakeTab()
     monkeypatch.setattr(web, "Tab", lambda port: tab)
     assert web.main(["--logout"]) == 0
     joined = "\n".join(tab.calls)
-    assert "auth.logOut" in joined and "location.reload()" in joined and "messages.getHistory" not in joined
-    assert joined.index("auth.logOut") < joined.index("location.reload()")
-    assert tab.logged_in is False and "logged out: True" in capsys.readouterr().out
-    # already logged out: idempotent, no logOut call
+    steps = ["auth.logOut", "DEVTOOLS Storage.clearDataForOrigin", "REOPEN https://web.telegram.org/k/", "help.getNearestDc",
+             "users.getUsers"]
+    pos = [joined.index(s) for s in steps[:4]] + [joined.rindex(steps[4])]
+    assert pos == sorted(pos) and "messages.getHistory" not in joined and "location.reload" not in joined
+    assert json.loads(next(c for c in tab.calls if c.startswith("DEVTOOLS")).split(" ", 2)[2]) == \
+        {"origin": "https://web.telegram.org", "storageTypes": "all"}
+    assert tab.logged_in is False and tab.closed and "logged out: True" in capsys.readouterr().out
+    # already logged out: idempotent, nothing but the login check
     tab2 = FakeTab(logged_in=False)
     monkeypatch.setattr(web, "Tab", lambda port: tab2)
-    assert web.main(["--logout"]) == 0 and not any("auth.logOut" in c for c in tab2.calls)
-    # logOut rejected -> exit 1
+    assert web.main(["--logout"]) == 0 and len(tab2.calls) == 1 and "already logged out" in capsys.readouterr().out
+    # logOut rejected -> exit 1, storage untouched
     tab3 = FakeTab(errors={"auth.logOut": '{"type":"NOPE"}'})
     monkeypatch.setattr(web, "Tab", lambda port: tab3)
+    assert web.main(["--logout"]) == 1 and not any(c.startswith(("DEVTOOLS", "REOPEN")) for c in tab3.calls)
+    capsys.readouterr()
+    # the reopened page still logs in (login keys survived) -> NOT 'logged out', exit 1, and it says what it saw
+    tab4 = FakeTab(relogin=True)
+    monkeypatch.setattr(web, "Tab", lambda port: tab4)
     assert web.main(["--logout"]) == 1
+    out = capsys.readouterr().out
+    assert "logged out: True" not in out and "logged out: False" in out and "still logged in: True" in out
+    # the client does not answer after the reopen -> exit 1
+    tab5 = FakeTab(dc_fails=True)
+    monkeypatch.setattr(web, "Tab", lambda port: tab5)
+    assert web.main(["--logout"]) == 1
+    out = capsys.readouterr().out
+    assert "logged out: False" in out and "getNearestDc ok: False" in out and "NETWORK_DOWN" in out
 
 
 def test_no_tab_returns_4(monkeypatch, capsys):

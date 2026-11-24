@@ -273,8 +273,8 @@ def extract_tar(opener, size: int, month: str, cfg: Cfg) -> dict:
                     mf.write(json.dumps({
                         "market_id": mid, "event_id": md.get("eventId"), "event_name": md.get("eventName"),
                         "market_type": md.get("marketType"), "market_time": md.get("marketTime"),
-                        "country_code": md.get("countryCode"), "bytes": len(data), "member": m.name,
-                        "saved": saved}) + "\n")
+                        "country_code": md.get("countryCode"), "event_type_id": md.get("eventTypeId"),
+                        "bytes": len(data), "member": m.name, "saved": saved}) + "\n")
                     rows += 1
                     if rows % 200 == 0:
                         mf.flush()
