@@ -1,0 +1,20 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Private data and results - never commit (this repository is public)
+shootingbets/data/
+shootingbets/output/
+shootingbets/betfair_cache/
+*.tar
+*.bz2
+result.json
+*result*.json
+betfair_spec.json
