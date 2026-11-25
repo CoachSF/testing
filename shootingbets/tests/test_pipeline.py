@@ -7,7 +7,7 @@ import pytest
 from conftest import MIN, T0, to_bytes
 from sbroi.betfair_files import load_markets
 from sbroi.matching import build_event_index
-from sbroi.pipeline import Config, enrich
+from sbroi.pipeline import Config, MarketFileMissing, enrich
 from test_pro_book import OFF, alerts, pro_lines
 
 
@@ -156,3 +156,14 @@ def test_asian_handicap_has_no_tick_columns_but_keeps_every_price_column(tmp_pat
               "xfx_back_lay_h100000", "ref_back_pl", "mins_to_off"):
         assert ah[c] == pytest.approx(mo[c]), c                                      # same prices, same P/L
     assert ah["xfx_back_lay_h10"] == pytest.approx((2.48 / 2.40 - 1) * 0.95) and ah["xfx_back_lay_h10_reason"] == "time"
+
+
+def test_a_listed_market_whose_file_is_gone_raises_but_an_absent_type_is_no_market(tmp_path):
+    mk, idx = _pro_dir_with(tmp_path, ("1.800000001", {}))
+    al = alerts(("Arsenal FC", "Chelsea FC"))
+    other = al.assign(bf_market="OVER_UNDER_25")                                  # the event has no market of this type
+    assert list(enrich(other, mk, idx, Config(commissions=(0.0,)))["status"]) == ["no_market"]
+    del mk["1.800000001"]                                                         # still in the event index (the manifest), file gone
+    with pytest.raises(MarketFileMissing, match=r"34000001.*MATCH_ODDS.*1\.800000001.*trimmed"):
+        enrich(al, mk, idx, Config(commissions=(0.0,)))
+    assert list(enrich(other, mk, idx, Config(commissions=(0.0,)))["status"]) == ["no_market"]   # unchanged by the missing file

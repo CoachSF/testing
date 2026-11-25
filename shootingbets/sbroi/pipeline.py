@@ -101,13 +101,20 @@ def _name(v) -> str | None:
     return v.strip() if isinstance(v, str) and v.strip() else None
 
 
+class MarketFileMissing(Exception):
+    """The manifest lists a market of the wanted type for the event, but its file is not on disk."""
+
+
 def _pick_market(markets: dict[str, MarketRecord], ev: EventInfo, mtype: str) -> MarketRecord | None:
     ids = find_markets(ev, mtype)
     if not ids:
         return None
+    gone = [i for i in ids if i not in markets]
+    if gone:
+        raise MarketFileMissing(f"event {ev.event_id}: manifest lists {mtype} market(s) {', '.join(map(str, gone))} "
+                                f"but the file is missing (the extract may have been trimmed)")
     # if several (rare), prefer the one with most LTP observations
-    recs = [markets[i] for i in ids if i in markets]
-    return max(recs, key=lambda m: sum(len(r.ltp_t) for r in m.runners.values())) if recs else None
+    return max((markets[i] for i in ids), key=lambda m: sum(len(r.ltp_t) for r in m.runners.values()))
 
 
 def enrich(alerts: pd.DataFrame, markets: dict[str, MarketRecord], index: dict[str, EventInfo],
